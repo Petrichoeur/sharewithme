@@ -27,12 +27,11 @@ spec:
         {{- toYaml . | nindent 8 }}
       {{- end }}
       volumes:
-        - name: shared-pipe
-          emptyDir:
-            medium: Memory
+        - name: restore-storage
+          emptyDir: {}
       initContainers:
-        # 1ÈRE IMAGE STANDARD : Télécharge le snapshot depuis S3 et l'écrit dans le pipe FIFO
-        - name: s3-downloader-producer
+        # ÉTAPE 1 (SÉQUENTIELLE) : aws-cli télécharge le dump depuis S3 vers le stockage temporaire
+        - name: s3-download
           image: {{ include "postgres-backup.s3Image" . | quote }}
           imagePullPolicy: {{ .Values.backupJob.s3Image.pullPolicy }}
           command:
@@ -40,9 +39,6 @@ spec:
             - -c
             - |
               set -euo pipefail
-              rm -f /pipe/restore.fifo
-              mkfifo /pipe/restore.fifo
-
               TARGET_FILE="{{ .Values.restore.dumpFile }}"
               EXTRA_S3_ARGS=""
               if [ -n "${S3_ENDPOINT_URL:-}" ]; then
@@ -55,9 +51,9 @@ spec:
                 S3_SOURCE="s3://${S3_BUCKET}/${S3_PREFIX}/${TARGET_FILE}"
               fi
 
-              echo "[RESTORE-PRODUCER] Téléchargement depuis ${S3_SOURCE} vers le FIFO..."
-              aws s3 cp "${S3_SOURCE}" /pipe/restore.fifo ${EXTRA_S3_ARGS}
-              echo "[RESTORE-PRODUCER] Téléchargement terminé."
+              echo "[RESTORE-DOWNLOAD] Téléchargement depuis ${S3_SOURCE}..."
+              aws s3 cp "${S3_SOURCE}" /restore/db.dump ${EXTRA_S3_ARGS}
+              echo "[RESTORE-DOWNLOAD] Fichier récupéré avec succès ($(du -h /restore/db.dump | awk '{print $1}'))."
           env:
             - name: AWS_ACCESS_KEY_ID
               valueFrom:
@@ -78,14 +74,14 @@ spec:
             - name: S3_ENDPOINT_URL
               value: {{ .Values.s3.endpointUrl | quote }}
           volumeMounts:
-            - name: shared-pipe
-              mountPath: /pipe
+            - name: restore-storage
+              mountPath: /restore
           resources:
             {{- toYaml .Values.resources | nindent 12 }}
 
       containers:
-        # 2ÈME IMAGE STANDARD : Lit le FIFO et restaure dans PostgreSQL avec pg_restore
-        - name: pg-restore-consumer
+        # ÉTAPE 2 (SÉQUENTIELLE) : pg_restore restaure la base depuis le fichier téléchargé
+        - name: pg-restore
           image: {{ include "postgres-backup.postgresImage" . | quote }}
           imagePullPolicy: {{ .Values.backupJob.postgresImage.pullPolicy }}
           command:
@@ -93,8 +89,9 @@ spec:
             - -c
             - |
               set -euo pipefail
-              echo "[RESTORE-CONSUMER] Lecture du FIFO et restauration vers ${PGDATABASE}..."
-              pg_restore -h "${PGHOST}" -p "${PGPORT}" -U "${PGUSER}" -d "${PGDATABASE}" {{ .Values.restore.pgRestoreArgs }} < /pipe/restore.fifo
+              echo "[PG-RESTORE] Démarrage de pg_restore sur ${PGDATABASE} (${PGHOST}:${PGPORT})..."
+              pg_restore -h "${PGHOST}" -p "${PGPORT}" -U "${PGUSER}" -d "${PGDATABASE}" {{ .Values.restore.pgRestoreArgs }} /restore/db.dump
+              rm -f /restore/db.dump
               echo "[SUCCESS] Base PostgreSQL restaurée avec succès !"
           env:
             - name: PGHOST
@@ -111,8 +108,8 @@ spec:
                   name: {{ default (printf "%s-pg-secret" (include "postgres-backup.fullname" .)) .Values.postgres.existingSecret }}
                   key: {{ .Values.postgres.secretKeyRef.passwordKey }}
           volumeMounts:
-            - name: shared-pipe
-              mountPath: /pipe
+            - name: restore-storage
+              mountPath: /restore
           resources:
             {{- toYaml .Values.resources | nindent 12 }}
 {{- end }}

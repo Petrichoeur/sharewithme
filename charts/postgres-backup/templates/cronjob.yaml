@@ -28,12 +28,11 @@ spec:
             {{- toYaml . | nindent 12 }}
           {{- end }}
           volumes:
-            - name: shared-pipe
-              emptyDir:
-                medium: Memory
+            - name: backup-storage
+              emptyDir: {}
           initContainers:
-            # 1ÈRE IMAGE STANDARD : Exécute pg_dump et écrit dans un named pipe FIFO partagé
-            - name: pg-dump-producer
+            # ÉTAPE 1 (SÉQUENTIELLE) : pg_dump écrit le fichier compressé sur le volume temporaire
+            - name: pg-dump
               image: {{ include "postgres-backup.postgresImage" . | quote }}
               imagePullPolicy: {{ .Values.backupJob.postgresImage.pullPolicy }}
               command:
@@ -41,13 +40,9 @@ spec:
                 - -c
                 - |
                   set -euo pipefail
-                  echo "[PRODUCER] Création du FIFO partagé..."
-                  rm -f /pipe/backup.fifo
-                  mkfifo /pipe/backup.fifo
-
-                  echo "[PRODUCER] Démarrage de pg_dump à chaud vers le pipe..."
-                  pg_dump -h "${PGHOST}" -p "${PGPORT}" -U "${PGUSER}" -d "${PGDATABASE}" {{ .Values.postgres.pgDumpArgs }} > /pipe/backup.fifo
-                  echo "[PRODUCER] pg_dump terminé avec succès."
+                  echo "[PG-DUMP] Démarrage du dump à chaud (${PGHOST}:${PGPORT} / base: ${PGDATABASE})..."
+                  pg_dump -h "${PGHOST}" -p "${PGPORT}" -U "${PGUSER}" -d "${PGDATABASE}" {{ .Values.postgres.pgDumpArgs }} -f /backup/db.dump
+                  echo "[PG-DUMP] Dump terminé avec succès ($(du -h /backup/db.dump | awk '{print $1}'))."
               env:
                 - name: PGHOST
                   value: {{ .Values.postgres.host | quote }}
@@ -63,14 +58,14 @@ spec:
                       name: {{ default (printf "%s-pg-secret" (include "postgres-backup.fullname" .)) .Values.postgres.existingSecret }}
                       key: {{ .Values.postgres.secretKeyRef.passwordKey }}
               volumeMounts:
-                - name: shared-pipe
-                  mountPath: /pipe
+                - name: backup-storage
+                  mountPath: /backup
               resources:
                 {{- toYaml .Values.resources | nindent 16 }}
 
           containers:
-            # 2ÈME IMAGE STANDARD : Lit le FIFO en streaming et l'envoie sur S3 (Zero local disk)
-            - name: s3-uploader-consumer
+            # ÉTAPE 2 (SÉQUENTIELLE) : aws-cli envoie vers S3, met à jour latest.dump et purge le local + rotation rolling S3
+            - name: s3-upload
               image: {{ include "postgres-backup.s3Image" . | quote }}
               imagePullPolicy: {{ .Values.backupJob.s3Image.pullPolicy }}
               command:
@@ -88,16 +83,20 @@ spec:
                     EXTRA_S3_ARGS="--endpoint-url ${S3_ENDPOINT_URL}"
                   fi
 
-                  echo "[CONSUMER] Lecture du FIFO et streaming vers S3 (${S3_DEST})..."
-                  aws s3 cp /pipe/backup.fifo "${S3_DEST}" ${EXTRA_S3_ARGS}
-                  echo "[CONSUMER] Snapshot uploadé avec succès !"
+                  echo "[S3-UPLOAD] Upload vers S3 (${S3_DEST})..."
+                  aws s3 cp /backup/db.dump "${S3_DEST}" ${EXTRA_S3_ARGS}
+                  echo "[S3-UPLOAD] Upload terminé avec succès."
 
                   aws s3 cp "${S3_DEST}" "${LATEST_DEST}" ${EXTRA_S3_ARGS}
-                  echo "[CONSUMER] latest.dump mis à jour."
+                  echo "[S3-UPLOAD] latest.dump mis à jour."
+
+                  # Nettoyage immédiat du fichier temporaire du Pod
+                  rm -f /backup/db.dump
+                  echo "[S3-UPLOAD] Nettoyage local effectué."
 
                   {{- if .Values.s3.rollingRotation.enabled }}
                   MAX_KEEP={{ .Values.s3.rollingRotation.maxSnapshots | default 7 }}
-                  echo "[CONSUMER] Rotation Rolling : conservation des ${MAX_KEEP} derniers snapshots..."
+                  echo "[S3-UPLOAD] Rotation Rolling : conservation des ${MAX_KEEP} derniers snapshots..."
                   ALL_SNAPSHOTS=$(aws s3 ls "s3://${S3_BUCKET}/${S3_PREFIX}/" ${EXTRA_S3_ARGS} | \
                     awk '{print $4}' | grep '\.dump$' | grep -v '^latest\.dump$' | sort)
                   
@@ -106,13 +105,13 @@ spec:
                     NB_TO_DELETE=$(( TOTAL_COUNT - MAX_KEEP ))
                     echo "${ALL_SNAPSHOTS}" | head -n "${NB_TO_DELETE}" | while read -r OLD_FILE; do
                       if [ -n "${OLD_FILE}" ]; then
-                        echo "[-] Suppression : ${OLD_FILE}"
+                        echo "[-] Suppression S3 : ${OLD_FILE}"
                         aws s3 rm "s3://${S3_BUCKET}/${S3_PREFIX}/${OLD_FILE}" ${EXTRA_S3_ARGS}
                       fi
                     done
                   fi
                   {{- end }}
-                  echo "[SUCCESS] Backup et rotation terminés avec succès !"
+                  echo "[SUCCESS] Sauvegarde terminée avec succès !"
               env:
                 - name: PGDATABASE
                   value: {{ .Values.postgres.database | quote }}
@@ -135,7 +134,7 @@ spec:
                 - name: S3_ENDPOINT_URL
                   value: {{ .Values.s3.endpointUrl | quote }}
               volumeMounts:
-                - name: shared-pipe
-                  mountPath: /pipe
+                - name: backup-storage
+                  mountPath: /backup
               resources:
                 {{- toYaml .Values.resources | nindent 16 }}

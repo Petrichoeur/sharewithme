@@ -26,9 +26,9 @@ Ce dépôt contient deux Helm Charts optimisés pour **OpenShift en environnemen
 │                                                                              │
 │   InitContainer (postgres:16-alpine)         Conteneur (aws-cli:latest)      │
 │   ┌───────────────────────────────┐          ┌───────────────────────────┐   │
-│   │ pg_dump -Fc (à chaud)         │ ──FIFO──>│ aws s3 cp - s3://...      │───┼──> S3 Interne
-│   └───────────────────────────────┘  (RAM)   │ (Purge Rolling > 7 snaps) │   │
-│                                              └───────────────────────────┘   │
+│   │ 1. pg_dump -Fc (à chaud)      │ ──File──>│ 2. aws s3 cp ...          │───┼──> S3 Interne
+│   │    vers /backup/db.dump       │ (volume) │    + Purge Rolling > 7    │   │
+│   └───────────────────────────────┘          └───────────────────────────┘   │
 └──────────────────────────────────────────────────────────────────────────────┘
 ```
 
