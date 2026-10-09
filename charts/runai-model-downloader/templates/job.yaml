@@ -1,0 +1,121 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: {{ include "runai-model-downloader.fullname" . }}
+  labels:
+    {{- include "runai-model-downloader.labels" . | nindent 4 }}
+  annotations:
+    # ArgoCD PostSync Hook pour exécuter le téléchargement et la création du volume automatiquement après sync du PVC
+    argocd.argoproj.io/hook: PostSync
+    argocd.argoproj.io/hook-delete-policy: BeforeHookCreation
+spec:
+  backoffLimit: 1
+  template:
+    metadata:
+      labels:
+        {{- include "runai-model-downloader.selectorLabels" . | nindent 8 }}
+    spec:
+      restartPolicy: Never
+      {{- with .Values.image.pullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.securityContext }}
+      securityContext:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      volumes:
+        - name: scripts
+          configMap:
+            name: {{ include "runai-model-downloader.fullname" . }}-scripts
+            defaultMode: 0755
+        - name: model-storage
+          persistentVolumeClaim:
+            claimName: {{ include "runai-model-downloader.fullname" . }}-pvc
+        {{- if .Values.customCa.enabled }}
+        - name: custom-ca
+          configMap:
+            name: {{ .Values.customCa.configMapName }}
+        {{- end }}
+      containers:
+        - name: model-downloader
+          image: {{ include "runai-model-downloader.image" . | quote }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          command:
+            - /bin/sh
+            - -c
+            - |
+              set -euo pipefail
+
+              echo "=== 1. Téléchargement du modèle HuggingFace depuis le miroir ==="
+              python3 /scripts/download_model.py
+
+              {{- if .Values.runai.enabled }}
+              echo "=== 2. Transformation en Data Volume Run:ai (API) ==="
+              python3 /scripts/register_runai_volume.py
+              {{- end }}
+
+              echo "=== Opération terminée avec succès ! ==="
+          env:
+            - name: MODEL_REPO_ID
+              value: {{ .Values.model.repoId | quote }}
+            - name: MODEL_REVISION
+              value: {{ .Values.model.revision | quote }}
+            - name: HF_ENDPOINT
+              value: {{ .Values.model.endpointUrl | quote }}
+            - name: TARGET_DIR
+              value: {{ .Values.storage.mountPath | quote }}
+            - name: PVC_NAME
+              value: {{ printf "%s-pvc" (include "runai-model-downloader.fullname" .) | quote }}
+            {{- if .Values.model.tokenSecretName }}
+            - name: HF_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.model.tokenSecretName | quote }}
+                  key: {{ .Values.model.tokenSecretKey | quote }}
+            {{- end }}
+            {{- if .Values.runai.enabled }}
+            - name: RUNAI_BASE_URL
+              value: {{ .Values.runai.controlPlaneUrl | quote }}
+            - name: RUNAI_CLUSTER_UUID
+              value: {{ .Values.runai.clusterUuid | quote }}
+            - name: RUNAI_VOLUME_NAME
+              value: {{ .Values.runai.dataVolumeName | quote }}
+            - name: RUNAI_VOLUME_DESC
+              value: {{ .Values.runai.dataVolumeDescription | quote }}
+            - name: RUNAI_PROJECT_NAME
+              value: {{ .Values.runai.projectName | quote }}
+            {{- if .Values.runai.authSecretName }}
+            - name: RUNAI_CLIENT_ID
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.runai.authSecretName | quote }}
+                  key: {{ .Values.runai.clientIdKey | quote }}
+                  optional: true
+            - name: RUNAI_CLIENT_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.runai.authSecretName | quote }}
+                  key: {{ .Values.runai.clientSecretKey | quote }}
+                  optional: true
+            {{- end }}
+            {{- end }}
+            {{- if .Values.customCa.enabled }}
+            - name: REQUESTS_CA_BUNDLE
+              value: "/etc/ssl/certs/corp-ca.crt"
+            - name: SSL_CERT_FILE
+              value: "/etc/ssl/certs/corp-ca.crt"
+            {{- end }}
+          volumeMounts:
+            - name: scripts
+              mountPath: /scripts
+            - name: model-storage
+              mountPath: {{ .Values.storage.mountPath }}
+            {{- if .Values.customCa.enabled }}
+            - name: custom-ca
+              mountPath: /etc/ssl/certs/corp-ca.crt
+              subPath: {{ .Values.customCa.caKey }}
+              readOnly: true
+            {{- end }}
+          resources:
+            {{- toYaml .Values.resources | nindent 12 }}

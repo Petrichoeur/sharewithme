@@ -1,0 +1,118 @@
+{{- if .Values.restore.enabled }}
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: {{ include "postgres-backup.fullname" . }}-restore-{{ now | date "20060102150405" }}
+  labels:
+    {{- include "postgres-backup.labels" . | nindent 4 }}
+    app.kubernetes.io/component: restore-job
+  annotations:
+    # Intégration ArgoCD : exécuté comme un PostSync Hook si souhaité, puis nettoyé
+    argocd.argoproj.io/hook: PostSync
+    argocd.argoproj.io/hook-delete-policy: BeforeHookCreation
+spec:
+  backoffLimit: 1
+  template:
+    metadata:
+      labels:
+        {{- include "postgres-backup.selectorLabels" . | nindent 8 }}
+    spec:
+      restartPolicy: Never
+      {{- with .Values.image.pullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.securityContext }}
+      securityContext:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      containers:
+        - name: pg-restore
+          image: {{ include "postgres-backup.image" . | quote }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          command:
+            - /bin/sh
+            - -c
+            - |
+              set -euo pipefail
+
+              TARGET_FILE="{{ .Values.restore.dumpFile }}"
+              EXTRA_S3_ARGS=""
+              if [ -n "${S3_ENDPOINT_URL:-}" ]; then
+                EXTRA_S3_ARGS="--endpoint-url ${S3_ENDPOINT_URL}"
+              fi
+              if [ -n "${AWS_CA_BUNDLE:-}" ]; then
+                EXTRA_S3_ARGS="${EXTRA_S3_ARGS} --ca-bundle ${AWS_CA_BUNDLE}"
+              fi
+
+              if [ "$TARGET_FILE" = "latest" ]; then
+                S3_SOURCE="s3://${S3_BUCKET}/${S3_PREFIX}/latest.dump"
+              else
+                S3_SOURCE="s3://${S3_BUCKET}/${S3_PREFIX}/${TARGET_FILE}"
+              fi
+
+              echo "[ALERT] ========================================================"
+              echo "[ALERT] RESTAURATION POSTGRESQL EN COURS"
+              echo "[ALERT] Cible  : ${PGDATABASE} (${PGHOST}:${PGPORT})"
+              echo "[ALERT] Source : ${S3_SOURCE}"
+              echo "[ALERT] ========================================================"
+
+              aws s3 ls "${S3_SOURCE}" ${EXTRA_S3_ARGS}
+
+              echo "[INFO] Streaming S3 -> pg_restore..."
+              aws s3 cp "${S3_SOURCE}" - ${EXTRA_S3_ARGS} | \
+                pg_restore -h "${PGHOST}" -p "${PGPORT}" -U "${PGUSER}" -d "${PGDATABASE}" {{ .Values.restore.pgRestoreArgs }}
+
+              echo "[SUCCESS] Base '${PGDATABASE}' restaurée avec succès !"
+          env:
+            - name: PGHOST
+              value: {{ .Values.postgres.host | quote }}
+            - name: PGPORT
+              value: {{ .Values.postgres.port | quote }}
+            - name: PGDATABASE
+              value: {{ .Values.postgres.database | quote }}
+            - name: PGUSER
+              value: {{ .Values.postgres.username | quote }}
+            - name: PGPASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: {{ default (printf "%s-pg-secret" (include "postgres-backup.fullname" .)) .Values.postgres.existingSecret }}
+                  key: {{ .Values.postgres.secretKeyRef.passwordKey }}
+                - name: AWS_ACCESS_KEY_ID
+                  valueFrom:
+                    secretKeyRef:
+                      name: {{ default (printf "%s-s3-secret" (include "postgres-backup.fullname" .)) .Values.s3.existingSecret }}
+                      key: aws-access-key-id
+                - name: AWS_SECRET_ACCESS_KEY
+                  valueFrom:
+                    secretKeyRef:
+                      name: {{ default (printf "%s-s3-secret" (include "postgres-backup.fullname" .)) .Values.s3.existingSecret }}
+                      key: aws-secret-access-key
+                - name: AWS_DEFAULT_REGION
+                  value: {{ .Values.s3.region | quote }}
+                - name: S3_BUCKET
+                  value: {{ .Values.s3.bucket | quote }}
+                - name: S3_PREFIX
+                  value: {{ .Values.s3.prefix | quote }}
+                - name: S3_ENDPOINT_URL
+                  value: {{ .Values.s3.endpointUrl | quote }}
+                {{- if .Values.s3.caCertConfigMap }}
+                - name: AWS_CA_BUNDLE
+                  value: "/etc/ssl/certs/s3-ca.crt"
+                {{- end }}
+              {{- if .Values.s3.caCertConfigMap }}
+              volumeMounts:
+                - name: s3-ca-cert
+                  mountPath: /etc/ssl/certs/s3-ca.crt
+                  subPath: {{ .Values.s3.caCertKey }}
+                  readOnly: true
+              {{- end }}
+              resources:
+                {{- toYaml .Values.resources | nindent 12 }}
+      {{- if .Values.s3.caCertConfigMap }}
+      volumes:
+        - name: s3-ca-cert
+          configMap:
+            name: {{ .Values.s3.caCertConfigMap }}
+      {{- end }}
+{{- end }}

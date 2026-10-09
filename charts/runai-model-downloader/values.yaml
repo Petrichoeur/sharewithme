@@ -1,0 +1,62 @@
+# Configuration du job de téléchargement de modèle HuggingFace / Miroir
+# Déployable avec ArgoCD en environnement Air-Gapped (Artifactory)
+
+image:
+  registry: "artifactory.internal.corp"
+  repository: "docker-local/model-downloader"
+  tag: "1.0.0"
+  pullPolicy: IfNotPresent
+  pullSecrets: []
+  # - name: artifactory-dockercfg
+
+model:
+  repoId: "mistralai/Mistral-7B-v0.1"
+  revision: "main"
+  # URL du repo miroir interne HuggingFace (Artifactory)
+  endpointUrl: "https://artifactory.internal.corp/artifactory/api/huggingface"
+  tokenSecretName: ""
+  tokenSecretKey: "HF_TOKEN"
+
+storage:
+  # Taille du PV dimensionnée au plus juste (calculée via calculate-size.py)
+  size: "16Gi"
+  # StorageClass OpenShift (ex: ocs-storagecluster-ceph-rbd, standard, gp3-csi)
+  storageClassName: "ocs-storagecluster-ceph-rbd"
+  accessModes:
+    - ReadWriteOnce
+  mountPath: "/mnt/models"
+
+# Intégration Run:ai Data Volume (selon doc officielle NVIDIA docs.run.ai)
+# Transforme le PVC en ressource Data Volume Run:ai partagée pour les chercheurs
+runai:
+  enabled: true
+  controlPlaneUrl: "https://runai.internal.corp"
+  clusterUuid: "" # Cluster ID Run:ai cible
+  authSecretName: "runai-api-credentials"
+  clientIdKey: "CLIENT_ID"
+  clientSecretKey: "CLIENT_SECRET"
+  dataVolumeName: "mistral-7b-v0-1"
+  dataVolumeDescription: "Modèle mistralai/Mistral-7B-v0.1 provisionné depuis Artifactory"
+  projectName: "ai-research"
+
+customCa:
+  enabled: false
+  configMapName: "corp-root-ca"
+  caKey: "ca.crt"
+
+securityContext:
+  runAsNonRoot: true
+  allowPrivilegeEscalation: false
+  capabilities:
+    drop:
+      - ALL
+  seccompProfile:
+    type: RuntimeDefault
+
+resources:
+  limits:
+    cpu: "4"
+    memory: "8Gi"
+  requests:
+    cpu: "1"
+    memory: "2Gi"

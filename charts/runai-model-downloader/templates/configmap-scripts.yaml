@@ -1,0 +1,111 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "runai-model-downloader.fullname" . }}-scripts
+  labels:
+    {{- include "runai-model-downloader.labels" . | nindent 4 }}
+data:
+  # Étape 1 : Téléchargement du modèle (snapshot_download)
+  download_model.py: |
+    import os
+    import sys
+    from huggingface_hub import snapshot_download
+
+    repo_id = os.environ.get("MODEL_REPO_ID")
+    endpoint = os.environ.get("HF_ENDPOINT", "https://huggingface.co")
+    revision = os.environ.get("MODEL_REVISION", "main")
+    token = os.environ.get("HF_TOKEN") or None
+    local_dir = os.environ.get("TARGET_DIR", "/mnt/models")
+
+    print(f"[DOWNLOAD] Démarrage du téléchargement : {repo_id} ({revision}) depuis {endpoint}")
+    print(f"[DOWNLOAD] Destination PVC monté : {local_dir}")
+
+    snapshot_download(
+        repo_id=repo_id,
+        revision=revision,
+        endpoint=endpoint,
+        token=token,
+        local_dir=local_dir,
+        local_dir_use_symlinks=False,
+        resume_download=True,
+        max_workers=4
+    )
+    print("[SUCCESS] Modèle téléchargé et vérifié avec succès !")
+
+  # Étape 2 : Création du Data Volume Run:ai (conforme doc docs.run.ai)
+  register_runai_volume.py: |
+    import os
+    import sys
+    import json
+    import urllib.request
+    import urllib.parse
+
+    runai_url = os.environ.get("RUNAI_BASE_URL", "https://runai.internal.corp").rstrip("/")
+    client_id = os.environ.get("RUNAI_CLIENT_ID")
+    client_secret = os.environ.get("RUNAI_CLIENT_SECRET")
+    cluster_uuid = os.environ.get("RUNAI_CLUSTER_UUID")
+    volume_name = os.environ.get("RUNAI_VOLUME_NAME")
+    volume_desc = os.environ.get("RUNAI_VOLUME_DESC", "Model Data Volume")
+    pvc_name = os.environ.get("PVC_NAME")
+    project_name = os.environ.get("RUNAI_PROJECT_NAME", "")
+
+    if not client_id or not client_secret:
+        print("[INFO] Authentification Run:ai non fournie. Fin.")
+        sys.exit(0)
+
+    print(f"[RUNAI] Récupération du Bearer token sur {runai_url}/api/v1/token...")
+    token_url = f"{runai_url}/api/v1/token"
+    payload = urllib.parse.urlencode({
+        "grant_type": "client_credentials",
+        "client_id": client_id,
+        "client_secret": client_secret
+    }).encode("utf-8")
+
+    req = urllib.request.Request(token_url, data=payload, headers={"Content-Type": "application/x-www-form-urlencoded"})
+    try:
+        with urllib.request.urlopen(req) as resp:
+            token = json.loads(resp.read().decode()).get("access_token")
+    except Exception as e:
+        print(f"[ERROR] Échec obtention token Run:ai: {e}")
+        sys.exit(1)
+
+    print(f"[RUNAI] Enregistrement du PVC '{pvc_name}' en Data Volume '{volume_name}'...")
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "Content-Type": "application/json",
+        "Accept": "application/json"
+    }
+
+    body = {
+        "name": volume_name,
+        "description": volume_desc,
+        "type": "pvc",
+        "pvcName": pvc_name
+    }
+    if project_name:
+        body["project"] = project_name
+    if cluster_uuid:
+        body["clusterId"] = cluster_uuid
+
+    endpoints = [
+        f"{runai_url}/api/v1/datavolumes",
+        f"{runai_url}/api/v1/asset/datasource"
+    ]
+
+    for ep in endpoints:
+        try:
+            req_vol = urllib.request.Request(ep, data=json.dumps(body).encode("utf-8"), headers=headers, method="POST")
+            with urllib.request.urlopen(req_vol) as resp:
+                print(f"[SUCCESS] Data Volume '{volume_name}' créé avec succès dans Run:ai !")
+                sys.exit(0)
+        except urllib.error.HTTPError as he:
+            err = he.read().decode()
+            if he.code == 409 or "already exists" in err.lower():
+                print(f"[INFO] Le Data Volume '{volume_name}' existe déjà dans Run:ai.")
+                sys.exit(0)
+            elif he.code == 404:
+                continue
+            else:
+                print(f"[WARN] HTTP {he.code} sur {ep}: {err}")
+        except Exception as e:
+            print(f"[WARN] Erreur: {e}")

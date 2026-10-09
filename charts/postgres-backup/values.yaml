@@ -1,0 +1,70 @@
+# Configuration du CronJob de backup PostgreSQL & Restauration
+# Conçu pour déploiement via ArgoCD en environnement Air-Gapped (OpenShift)
+
+image:
+  registry: "artifactory.internal.corp"
+  repository: "docker-local/postgres-awscli"
+  tag: "16-v1"
+  pullPolicy: IfNotPresent
+  pullSecrets: []
+  # - name: artifactory-dockercfg
+
+cronjob:
+  # Exécution quotidienne (par défaut à 02:00 UTC)
+  schedule: "0 2 * * *"
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: 3
+  failedJobsHistoryLimit: 5
+
+postgres:
+  host: "postgres-postgresql.runai.svc.cluster.local"
+  port: 5432
+  database: "runai"
+  username: "postgres"
+  existingSecret: ""
+  secretKeyRef:
+    passwordKey: "postgres-password"
+  password: ""
+  # Dump à chaud en format custom compressé
+  pgDumpArgs: "-Fc --verbose --no-owner --no-privileges"
+
+s3:
+  endpointUrl: "https://s3.internal.corp"
+  region: "us-east-1"
+  bucket: "runai-pg-backups"
+  prefix: "postgres-runai"
+  caCertConfigMap: ""
+  caCertKey: "ca.crt"
+  existingSecret: ""
+  accessKeyId: ""
+  secretAccessKey: ""
+
+  # ROTATION ROLLING : Conserve STRICTEMENT les N derniers snapshots sur S3 (ex: 7 jours)
+  # À chaque nouveau backup réussi, les plus anciens au-delà de maxSnapshots sont purgés
+  rollingRotation:
+    enabled: true
+    maxSnapshots: 7 # Conserve exactement les 7 derniers snapshots quotidiens
+
+# Job de Restauration ponctuel (ArgoCD Sync Hook ou déclenchement ciblé)
+restore:
+  enabled: false
+  # "latest" ou nom précis du snapshot S3 (ex: runai_20261009_020000Z.dump)
+  dumpFile: "latest"
+  pgRestoreArgs: "-Fc --clean --if-exists --no-owner --no-privileges --verbose"
+
+securityContext:
+  runAsNonRoot: true
+  allowPrivilegeEscalation: false
+  capabilities:
+    drop:
+      - ALL
+  seccompProfile:
+    type: RuntimeDefault
+
+resources:
+  limits:
+    cpu: "2"
+    memory: "2Gi"
+  requests:
+    cpu: "250m"
+    memory: "512Mi"
