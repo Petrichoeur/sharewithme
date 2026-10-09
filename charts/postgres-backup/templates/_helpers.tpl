@@ -40,12 +40,23 @@ app.kubernetes.io/instance: {{ .Release.Name }}
 {{- end }}
 
 {{/*
-Docker image reference with registry support
+PostgreSQL Stock Image reference
 */}}
-{{- define "postgres-backup.image" -}}
-{{- if .Values.image.registry }}
-{{- printf "%s/%s:%s" .Values.image.registry .Values.image.repository .Values.image.tag }}
+{{- define "postgres-backup.postgresImage" -}}
+{{- if .Values.backupJob.postgresImage.registry }}
+{{- printf "%s/%s:%s" .Values.backupJob.postgresImage.registry .Values.backupJob.postgresImage.repository .Values.backupJob.postgresImage.tag }}
 {{- else }}
-{{- printf "%s:%s" .Values.image.repository .Values.image.tag }}
+{{- printf "%s:%s" .Values.backupJob.postgresImage.repository .Values.backupJob.postgresImage.tag }}
+{{- end }}
+{{- end }}
+
+{{/*
+S3 Stock Image reference
+*/}}
+{{- define "postgres-backup.s3Image" -}}
+{{- if .Values.backupJob.s3Image.registry }}
+{{- printf "%s/%s:%s" .Values.backupJob.s3Image.registry .Values.backupJob.s3Image.repository .Values.backupJob.s3Image.tag }}
+{{- else }}
+{{- printf "%s:%s" .Values.backupJob.s3Image.repository .Values.backupJob.s3Image.tag }}
 {{- end }}
 {{- end }}

@@ -18,7 +18,7 @@ spec:
             {{- include "postgres-backup.selectorLabels" . | nindent 12 }}
         spec:
           restartPolicy: OnFailure
-          {{- with .Values.image.pullSecrets }}
+          {{- with .Values.backupJob.pullSecrets }}
           imagePullSecrets:
             {{- toYaml . | nindent 12 }}
           {{- end }}
@@ -26,68 +26,27 @@ spec:
           securityContext:
             {{- toYaml . | nindent 12 }}
           {{- end }}
-          containers:
-            - name: pg-backup
-              image: {{ include "postgres-backup.image" . | quote }}
-              imagePullPolicy: {{ .Values.image.pullPolicy }}
+          volumes:
+            - name: shared-pipe
+              emptyDir:
+                medium: Memory
+          initContainers:
+            # 1ÈRE IMAGE STANDARD : Exécute pg_dump et écrit dans un named pipe FIFO partagé
+            - name: pg-dump-producer
+              image: {{ include "postgres-backup.postgresImage" . | quote }}
+              imagePullPolicy: {{ .Values.backupJob.postgresImage.pullPolicy }}
               command:
                 - /bin/sh
                 - -c
                 - |
                   set -euo pipefail
+                  echo "[PRODUCER] Création du FIFO partagé..."
+                  rm -f /pipe/backup.fifo
+                  mkfifo /pipe/backup.fifo
 
-                  TIMESTAMP=$(date -u +%Y%m%d_%H%M%SZ)
-                  BACKUP_FILE="${PGDATABASE}_${TIMESTAMP}.dump"
-                  S3_DEST="s3://${S3_BUCKET}/${S3_PREFIX}/${BACKUP_FILE}"
-                  LATEST_DEST="s3://${S3_BUCKET}/${S3_PREFIX}/latest.dump"
-
-                  echo "[INFO] Démarrage du dump PostgreSQL à chaud (${PGHOST}:${PGPORT} / base: ${PGDATABASE})..."
-
-                  EXTRA_S3_ARGS=""
-                  if [ -n "${S3_ENDPOINT_URL:-}" ]; then
-                    EXTRA_S3_ARGS="--endpoint-url ${S3_ENDPOINT_URL}"
-                  fi
-                  if [ -n "${AWS_CA_BUNDLE:-}" ]; then
-                    EXTRA_S3_ARGS="${EXTRA_S3_ARGS} --ca-bundle ${AWS_CA_BUNDLE}"
-                  fi
-
-                  # Streaming direct pg_dump -> S3 (zéro stockage disque local)
-                  pg_dump -h "${PGHOST}" -p "${PGPORT}" -U "${PGUSER}" -d "${PGDATABASE}" {{ .Values.postgres.pgDumpArgs }} | \
-                    aws s3 cp - "${S3_DEST}" ${EXTRA_S3_ARGS}
-
-                  echo "[INFO] Snapshot archivé avec succès : ${S3_DEST}"
-
-                  # Mise à jour du tag 'latest.dump'
-                  aws s3 cp "${S3_DEST}" "${LATEST_DEST}" ${EXTRA_S3_ARGS}
-                  echo "[INFO] latest.dump mis à jour."
-
-                  {{- if .Values.s3.rollingRotation.enabled }}
-                  MAX_KEEP={{ .Values.s3.rollingRotation.maxSnapshots | default 7 }}
-                  echo "[INFO] Rotation Rolling : conservation stricte des ${MAX_KEEP} derniers snapshots..."
-
-                  # Liste tous les snapshots triés par date/nom (format ISO chronologique), exclut latest.dump
-                  ALL_SNAPSHOTS=$(aws s3 ls "s3://${S3_BUCKET}/${S3_PREFIX}/" ${EXTRA_S3_ARGS} | \
-                    awk '{print $4}' | grep '\.dump$' | grep -v '^latest\.dump$' | sort)
-
-                  TOTAL_COUNT=$(echo "${ALL_SNAPSHOTS}" | grep -c . || true)
-                  echo "[INFO] Nombre total actuel de snapshots sur S3 : ${TOTAL_COUNT}"
-
-                  if [ "${TOTAL_COUNT}" -gt "${MAX_KEEP}" ]; then
-                    NB_TO_DELETE=$(( TOTAL_COUNT - MAX_KEEP ))
-                    echo "[INFO] Suppression de ${NB_TO_DELETE} ancien(s) snapshot(s)..."
-
-                    echo "${ALL_SNAPSHOTS}" | head -n "${NB_TO_DELETE}" | while read -r OLD_FILE; do
-                      if [ -n "${OLD_FILE}" ]; then
-                        echo "[-] Purge de l'ancien snapshot : ${OLD_FILE}"
-                        aws s3 rm "s3://${S3_BUCKET}/${S3_PREFIX}/${OLD_FILE}" ${EXTRA_S3_ARGS}
-                      fi
-                    done
-                  else
-                    echo "[INFO] Quota respecté (${TOTAL_COUNT}/${MAX_KEEP}). Aucune purge nécessaire."
-                  fi
-                  {{- end }}
-
-                  echo "[SUCCESS] Processus de sauvegarde et rotation rolling terminé !"
+                  echo "[PRODUCER] Démarrage de pg_dump à chaud vers le pipe..."
+                  pg_dump -h "${PGHOST}" -p "${PGPORT}" -U "${PGUSER}" -d "${PGDATABASE}" {{ .Values.postgres.pgDumpArgs }} > /pipe/backup.fifo
+                  echo "[PRODUCER] pg_dump terminé avec succès."
               env:
                 - name: PGHOST
                   value: {{ .Values.postgres.host | quote }}
@@ -102,6 +61,60 @@ spec:
                     secretKeyRef:
                       name: {{ default (printf "%s-pg-secret" (include "postgres-backup.fullname" .)) .Values.postgres.existingSecret }}
                       key: {{ .Values.postgres.secretKeyRef.passwordKey }}
+              volumeMounts:
+                - name: shared-pipe
+                  mountPath: /pipe
+              resources:
+                {{- toYaml .Values.resources | nindent 16 }}
+
+          containers:
+            # 2ÈME IMAGE STANDARD : Lit le FIFO en streaming et l'envoie sur S3 (Zero local disk)
+            - name: s3-uploader-consumer
+              image: {{ include "postgres-backup.s3Image" . | quote }}
+              imagePullPolicy: {{ .Values.backupJob.s3Image.pullPolicy }}
+              command:
+                - /bin/sh
+                - -c
+                - |
+                  set -euo pipefail
+                  TIMESTAMP=$(date -u +%Y%m%d_%H%M%SZ)
+                  BACKUP_FILE="${PGDATABASE}_${TIMESTAMP}.dump"
+                  S3_DEST="s3://${S3_BUCKET}/${S3_PREFIX}/${BACKUP_FILE}"
+                  LATEST_DEST="s3://${S3_BUCKET}/${S3_PREFIX}/latest.dump"
+
+                  EXTRA_S3_ARGS=""
+                  if [ -n "${S3_ENDPOINT_URL:-}" ]; then
+                    EXTRA_S3_ARGS="--endpoint-url ${S3_ENDPOINT_URL}"
+                  fi
+
+                  echo "[CONSUMER] Lecture du FIFO et streaming vers S3 (${S3_DEST})..."
+                  aws s3 cp /pipe/backup.fifo "${S3_DEST}" ${EXTRA_S3_ARGS}
+                  echo "[CONSUMER] Snapshot uploadé avec succès !"
+
+                  aws s3 cp "${S3_DEST}" "${LATEST_DEST}" ${EXTRA_S3_ARGS}
+                  echo "[CONSUMER] latest.dump mis à jour."
+
+                  {{- if .Values.s3.rollingRotation.enabled }}
+                  MAX_KEEP={{ .Values.s3.rollingRotation.maxSnapshots | default 7 }}
+                  echo "[CONSUMER] Rotation Rolling : conservation des ${MAX_KEEP} derniers snapshots..."
+                  ALL_SNAPSHOTS=$(aws s3 ls "s3://${S3_BUCKET}/${S3_PREFIX}/" ${EXTRA_S3_ARGS} | \
+                    awk '{print $4}' | grep '\.dump$' | grep -v '^latest\.dump$' | sort)
+                  
+                  TOTAL_COUNT=$(echo "${ALL_SNAPSHOTS}" | grep -c . || true)
+                  if [ "${TOTAL_COUNT}" -gt "${MAX_KEEP}" ]; then
+                    NB_TO_DELETE=$(( TOTAL_COUNT - MAX_KEEP ))
+                    echo "${ALL_SNAPSHOTS}" | head -n "${NB_TO_DELETE}" | while read -r OLD_FILE; do
+                      if [ -n "${OLD_FILE}" ]; then
+                        echo "[-] Suppression : ${OLD_FILE}"
+                        aws s3 rm "s3://${S3_BUCKET}/${S3_PREFIX}/${OLD_FILE}" ${EXTRA_S3_ARGS}
+                      fi
+                    done
+                  fi
+                  {{- end }}
+                  echo "[SUCCESS] Backup et rotation terminés avec succès !"
+              env:
+                - name: PGDATABASE
+                  value: {{ .Values.postgres.database | quote }}
                 - name: AWS_ACCESS_KEY_ID
                   valueFrom:
                     secretKeyRef:
@@ -120,22 +133,8 @@ spec:
                   value: {{ .Values.s3.prefix | quote }}
                 - name: S3_ENDPOINT_URL
                   value: {{ .Values.s3.endpointUrl | quote }}
-                {{- if .Values.s3.caCertConfigMap }}
-                - name: AWS_CA_BUNDLE
-                  value: "/etc/ssl/certs/s3-ca.crt"
-                {{- end }}
-              {{- if .Values.s3.caCertConfigMap }}
               volumeMounts:
-                - name: s3-ca-cert
-                  mountPath: /etc/ssl/certs/s3-ca.crt
-                  subPath: {{ .Values.s3.caCertKey }}
-                  readOnly: true
-              {{- end }}
+                - name: shared-pipe
+                  mountPath: /pipe
               resources:
                 {{- toYaml .Values.resources | nindent 16 }}
-          {{- if .Values.s3.caCertConfigMap }}
-          volumes:
-            - name: s3-ca-cert
-              configMap:
-                name: {{ .Values.s3.caCertConfigMap }}
-          {{- end }}

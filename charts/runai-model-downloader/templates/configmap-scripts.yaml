@@ -5,38 +5,74 @@ metadata:
   labels:
     {{- include "runai-model-downloader.labels" . | nindent 4 }}
 data:
-  # Étape 1 : Téléchargement du modèle (snapshot_download)
+  # Étape 1 : Téléchargement du modèle en pur Python standard (sans huggingface_hub / pip)
   download_model.py: |
     import os
     import sys
-    from huggingface_hub import snapshot_download
+    import json
+    import ssl
+    import urllib.request
+    import urllib.parse
 
     repo_id = os.environ.get("MODEL_REPO_ID")
-    endpoint = os.environ.get("HF_ENDPOINT", "https://huggingface.co")
+    endpoint = os.environ.get("HF_ENDPOINT", "https://huggingface.co").rstrip("/")
     revision = os.environ.get("MODEL_REVISION", "main")
-    token = os.environ.get("HF_TOKEN") or None
+    token = os.environ.get("HF_TOKEN")
     local_dir = os.environ.get("TARGET_DIR", "/mnt/models")
 
-    print(f"[DOWNLOAD] Démarrage du téléchargement : {repo_id} ({revision}) depuis {endpoint}")
-    print(f"[DOWNLOAD] Destination PVC monté : {local_dir}")
+    # Support CA d'entreprise custom si monté
+    ctx = ssl.create_default_context()
+    ca_bundle = os.environ.get("REQUESTS_CA_BUNDLE") or os.environ.get("SSL_CERT_FILE")
+    if ca_bundle and os.path.exists(ca_bundle):
+        ctx.load_verify_locations(cafile=ca_bundle)
 
-    snapshot_download(
-        repo_id=repo_id,
-        revision=revision,
-        endpoint=endpoint,
-        token=token,
-        local_dir=local_dir,
-        local_dir_use_symlinks=False,
-        resume_download=True,
-        max_workers=4
-    )
-    print("[SUCCESS] Modèle téléchargé et vérifié avec succès !")
+    headers = {"User-Agent": "airgap-model-downloader/1.0"}
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+
+    api_url = f"{endpoint}/api/models/{repo_id}/revision/{revision}"
+    print(f"[DOWNLOAD] Récupération de la liste des fichiers depuis {api_url}...")
+
+    req = urllib.request.Request(api_url, headers=headers)
+    try:
+        with urllib.request.urlopen(req, context=ctx) as resp:
+            data = json.loads(resp.read().decode())
+    except Exception as e:
+        print(f"[ERROR] Impossible de joindre l'API du miroir ({api_url}): {e}")
+        sys.exit(1)
+
+    siblings = data.get("siblings", [])
+    if not siblings:
+        print("[ERROR] Aucun fichier trouvé dans ce repo modèle.")
+        sys.exit(1)
+
+    total_files = len(siblings)
+    print(f"[DOWNLOAD] {total_files} fichiers à télécharger vers {local_dir}")
+
+    for idx, item in enumerate(siblings, start=1):
+        rel_path = item["rfilename"]
+        dest_path = os.path.join(local_dir, rel_path)
+        os.makedirs(os.path.dirname(dest_path), exist_ok=True)
+
+        download_url = f"{endpoint}/{repo_id}/resolve/{revision}/{rel_path}"
+        print(f"[{idx}/{total_files}] Téléchargement de {rel_path}...")
+
+        file_req = urllib.request.Request(download_url, headers=headers)
+        with urllib.request.urlopen(file_req, context=ctx) as file_resp, open(dest_path, "wb") as out_file:
+            while True:
+                chunk = file_resp.read(16 * 1024 * 1024) # 16 MB chunks
+                if not chunk:
+                    break
+                out_file.write(chunk)
+
+    print("[SUCCESS] Tous les fichiers du modèle ont été téléchargés et stockés dans le PV !")
 
   # Étape 2 : Création du Data Volume Run:ai (conforme doc docs.run.ai)
   register_runai_volume.py: |
     import os
     import sys
     import json
+    import ssl
     import urllib.request
     import urllib.parse
 
@@ -48,6 +84,11 @@ data:
     volume_desc = os.environ.get("RUNAI_VOLUME_DESC", "Model Data Volume")
     pvc_name = os.environ.get("PVC_NAME")
     project_name = os.environ.get("RUNAI_PROJECT_NAME", "")
+
+    ctx = ssl.create_default_context()
+    ca_bundle = os.environ.get("REQUESTS_CA_BUNDLE") or os.environ.get("SSL_CERT_FILE")
+    if ca_bundle and os.path.exists(ca_bundle):
+        ctx.load_verify_locations(cafile=ca_bundle)
 
     if not client_id or not client_secret:
         print("[INFO] Authentification Run:ai non fournie. Fin.")
@@ -63,7 +104,7 @@ data:
 
     req = urllib.request.Request(token_url, data=payload, headers={"Content-Type": "application/x-www-form-urlencoded"})
     try:
-        with urllib.request.urlopen(req) as resp:
+        with urllib.request.urlopen(req, context=ctx) as resp:
             token = json.loads(resp.read().decode()).get("access_token")
     except Exception as e:
         print(f"[ERROR] Échec obtention token Run:ai: {e}")
@@ -95,7 +136,7 @@ data:
     for ep in endpoints:
         try:
             req_vol = urllib.request.Request(ep, data=json.dumps(body).encode("utf-8"), headers=headers, method="POST")
-            with urllib.request.urlopen(req_vol) as resp:
+            with urllib.request.urlopen(req_vol, context=ctx) as resp:
                 print(f"[SUCCESS] Data Volume '{volume_name}' créé avec succès dans Run:ai !")
                 sys.exit(0)
         except urllib.error.HTTPError as he:

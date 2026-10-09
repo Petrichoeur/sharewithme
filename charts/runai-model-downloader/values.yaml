@@ -1,10 +1,10 @@
 # Configuration du job de téléchargement de modèle HuggingFace / Miroir
-# Déployable avec ArgoCD en environnement Air-Gapped (Artifactory)
+# Utilise une image standard Python officielle d'Artifactory sans build ni pip install
 
 image:
   registry: "artifactory.internal.corp"
-  repository: "docker-local/model-downloader"
-  tag: "1.0.0"
+  repository: "docker-local/python"
+  tag: "3.11-slim"
   pullPolicy: IfNotPresent
   pullSecrets: []
   # - name: artifactory-dockercfg

@@ -1,16 +1,28 @@
 # Configuration du CronJob de backup PostgreSQL & Restauration
-# Conçu pour déploiement via ArgoCD en environnement Air-Gapped (OpenShift)
+# Adapté aux environnements Air-Gapped stricts sans build d'image personnalisé
+# Utilise des images officielles standards d'Artifactory sans aucune installation ni build
 
-image:
-  registry: "artifactory.internal.corp"
-  repository: "docker-local/postgres-awscli"
-  tag: "16-v1"
-  pullPolicy: IfNotPresent
+backupJob:
+  # Étape 1 : Image PostgreSQL standard présente dans Artifactory (contient pg_dump et pg_restore)
+  postgresImage:
+    registry: "artifactory.internal.corp"
+    repository: "docker-local/postgres"
+    tag: "16-alpine"
+    pullPolicy: IfNotPresent
+
+  # Étape 2 : Image S3 standard présente dans Artifactory (amazon/aws-cli, minio/mc ou curlimages/curl)
+  # Par défaut, image standard aws-cli officielle ou alpine avec curl
+  s3Image:
+    registry: "artifactory.internal.corp"
+    repository: "docker-local/aws-cli"
+    tag: "latest"
+    pullPolicy: IfNotPresent
+
   pullSecrets: []
   # - name: artifactory-dockercfg
 
 cronjob:
-  # Exécution quotidienne (par défaut à 02:00 UTC)
+  # Exécution quotidienne
   schedule: "0 2 * * *"
   concurrencyPolicy: Forbid
   successfulJobsHistoryLimit: 3
@@ -25,31 +37,28 @@ postgres:
   secretKeyRef:
     passwordKey: "postgres-password"
   password: ""
-  # Dump à chaud en format custom compressé
+  # Paramètres pg_dump à chaud (format custom compressé)
   pgDumpArgs: "-Fc --verbose --no-owner --no-privileges"
 
 s3:
+  # Endpoint S3 interne (MinIO / Ceph / S3 interne)
   endpointUrl: "https://s3.internal.corp"
   region: "us-east-1"
   bucket: "runai-pg-backups"
   prefix: "postgres-runai"
-  caCertConfigMap: ""
-  caCertKey: "ca.crt"
   existingSecret: ""
   accessKeyId: ""
   secretAccessKey: ""
 
-  # ROTATION ROLLING : Conserve STRICTEMENT les N derniers snapshots sur S3 (ex: 7 jours)
-  # À chaque nouveau backup réussi, les plus anciens au-delà de maxSnapshots sont purgés
+  # Rotation Rolling : conserve strictement les 7 derniers snapshots
   rollingRotation:
     enabled: true
-    maxSnapshots: 7 # Conserve exactement les 7 derniers snapshots quotidiens
+    maxSnapshots: 7
 
-# Job de Restauration ponctuel (ArgoCD Sync Hook ou déclenchement ciblé)
+# Restauration à chaud
 restore:
   enabled: false
-  # "latest" ou nom précis du snapshot S3 (ex: runai_20261009_020000Z.dump)
-  dumpFile: "latest"
+  dumpFile: "latest" # ou nom précis ex: runai_20261009_020000Z.dump
   pgRestoreArgs: "-Fc --clean --if-exists --no-owner --no-privileges --verbose"
 
 securityContext:

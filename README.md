@@ -1,20 +1,26 @@
 # sharewithme
 
-Charts Helm prêts pour **ArgoCD** sur **OpenShift Air-Gapped** (images et dépôts modèles via Artifactory).
+Charts Helm conçus pour **OpenShift en environnement Air-Gapped strict** :
+- **Zéro build d'image Docker** : Fonctionne directement avec les images officielles standard présentes dans votre Artifactory.
+- **Zéro installation au runtime (`pip`, `apk`, `apt`)** : Tous les scripts tournent avec la bibliothèque standard Python (`urllib`, `json`, `ssl`).
+- **Déploiement ArgoCD Ready** : Intègre les annotations de synchronisation `argocd.argoproj.io/hook`.
 
 ---
 
-## 1. `charts/postgres-backup` (Backup Rolling 7 jours & Restore)
+## 1. `charts/postgres-backup` : Backup & Restore (2 Images Standards + FIFO)
 
-Sauvegarde quotidienne à chaud de la base PostgreSQL de prod (`runai`) vers un S3 interne, avec conservation stricte des **7 derniers snapshots**.
+### Architecture Zero-Build :
+Pour éviter tout build d'image combinant `pg_dump` et `aws-cli`, le pod s'appuie sur deux conteneurs utilisant des images officielles standards couplées par un **named pipe FIFO** en mémoire (`emptyDir: medium: Memory`) :
+1. **Conteneur PostgreSQL (`postgres:16-alpine`)** : Exécute `pg_dump` à chaud et écrit dans le pipe FIFO.
+2. **Conteneur S3 (`amazon/aws-cli:latest` ou équivalent standard)** : Lit le pipe FIFO et streame directement vers le S3 interne.
+*(Même principe inversé pour la restauration à chaud : le conteneur S3 télécharge vers le FIFO, puis `postgres` lit le FIFO et applique `pg_restore`)*.
 
-### Fonctionnement
-- **Dump à chaud** : `pg_dump -Fc` streamé directement vers S3 (`aws s3 cp - ...`). Aucun fichier temporaire sur le disque du pod (zéro risque de crash disque plein).
-- **Rolling Snapshots (7 jours)** : À chaque sauvegarde, le CronJob liste les dumps S3 et purge les plus anciens pour n'en conserver **que 7**.
-- **Restore immédiat** : Un job déclenchable à la demande (supporte les annotations ArgoCD Hook) pour streamer le snapshot S3 vers `pg_restore`.
+### Fonctionnalités
+- **Rolling 7 Snapshots** : Conserve strictement les **7 derniers dumps** quotidiens sur S3 et purge les plus anciens.
+- **Zéro écriture disque Pod** : Le flux transite par le FIFO en RAM, aucun risque de remplir le disque éphémère du pod.
+- **Restauration immédiate** : Job à la demande (`restore.enabled=true`) pour restaurer `latest.dump` ou un snapshot spécifique.
 
-### Déploiement via ArgoCD
-Exemple d'Application ArgoCD :
+### Déploiement ArgoCD (`Application`)
 ```yaml
 apiVersion: argoproj.io/v1alpha1
 kind: Application
@@ -29,10 +35,15 @@ spec:
     path: charts/postgres-backup
     helm:
       values: |
-        image:
-          registry: artifactory.internal.corp
-          repository: docker-local/postgres-awscli
-          tag: "16-v1"
+        backupJob:
+          postgresImage:
+            registry: artifactory.internal.corp
+            repository: docker-local/postgres
+            tag: "16-alpine"
+          s3Image:
+            registry: artifactory.internal.corp
+            repository: docker-local/aws-cli
+            tag: "latest"
         postgres:
           host: postgres-postgresql.runai.svc.cluster.local
           database: runai
@@ -50,8 +61,7 @@ spec:
     namespace: runai
 ```
 
-### En cas de sinistre : Restaurer la base
-Passer `restore.enabled` à `true` dans les values ArgoCD (ou via Helm) :
+### Restauration en cas d'incident
 ```bash
 helm upgrade --install postgres-backup ./charts/postgres-backup -n runai \
   --reuse-values \
@@ -61,24 +71,22 @@ helm upgrade --install postgres-backup ./charts/postgres-backup -n runai \
 
 ---
 
-## 2. `charts/runai-model-downloader` (Modèle HF vers Run:ai Data Volume)
+## 2. `charts/runai-model-downloader` : Download Modèle HF & Run:ai Data Volume
 
-Télécharge un modèle HuggingFace depuis votre miroir interne Artifactory dans un PVC dimensionné au plus juste, et l'enregistre en tant que **Data Volume** dans Run:ai (selon la documentation officielle Run:ai).
+### Architecture Zero-Build :
+Utilise uniquement l'image officielle standard **`python:3.11-slim`** (sans aucun `pip install` de packages externes). Le script Python autonome utilise la bibliothèque standard (`urllib.request`) pour :
+1. Interroger l'API du miroir HuggingFace (Artifactory).
+2. Télécharger en chunks de 16 Mo chaque fichier du repo vers le PV.
+3. S'authentifier sur le Control Plane Run:ai (`/api/v1/token`) et enregistrer le PVC en tant que **Data Volume** partagé (`/api/v1/datavolumes`).
 
-### Étape 1 : Calculer la taille exacte du PV
-Un script simple est fourni pour interroger l'API du miroir et calculer la taille exacte (+15% pour le filesystem ext4/xfs) :
+### Étape 1 : Calcul de la taille optimale du PV
 ```bash
 python3 charts/runai-model-downloader/calculate-size.py \
   mistralai/Mistral-7B-v0.1 \
   --endpoint "https://artifactory.internal.corp/artifactory/api/huggingface"
 ```
-*Exemple de sortie : Modèle 14.48 GiB -> PV recommandé : `16Gi`.*
 
-### Étape 2 : Déploiement via ArgoCD
-Le chart déploie le PVC et lance un Job en **PostSync Hook** :
-1. Téléchargement propre sans liens symboliques (`snapshot_download`).
-2. Appel à l'API Run:ai (`/api/v1/token` puis `/api/v1/datavolumes`) pour créer le Data Volume rattaché au PVC.
-
+### Étape 2 : Déploiement ArgoCD (`Application`)
 ```yaml
 apiVersion: argoproj.io/v1alpha1
 kind: Application
@@ -95,8 +103,8 @@ spec:
       values: |
         image:
           registry: artifactory.internal.corp
-          repository: docker-local/model-downloader
-          tag: "1.0.0"
+          repository: docker-local/python
+          tag: "3.11-slim"
         model:
           repoId: "mistralai/Mistral-7B-v0.1"
           endpointUrl: "https://artifactory.internal.corp/artifactory/api/huggingface"
