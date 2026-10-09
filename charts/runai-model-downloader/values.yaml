@@ -1,13 +1,17 @@
-# Configuration du job de téléchargement de modèle HuggingFace / Miroir
-# Utilise une image standard Python officielle d'Artifactory sans build ni pip install
+# Global values (communes et surchargeables facilement par ArgoCD / Helm)
+global:
+  # Registry d'entreprise (Artifactory, Harbor, Quay)
+  imageRegistry: "artifactory.internal.corp"
+  imagePullSecrets: []
+  # - name: artifactory-dockercfg
 
+# Image standard Python
 image:
-  registry: "artifactory.internal.corp"
+  registry: "" # Vide pour hériter de global.imageRegistry
   repository: "docker-local/python"
   tag: "3.11-slim"
   pullPolicy: IfNotPresent
   pullSecrets: []
-  # - name: artifactory-dockercfg
 
 model:
   repoId: "mistralai/Mistral-7B-v0.1"
@@ -27,7 +31,6 @@ storage:
   mountPath: "/mnt/models"
 
 # Intégration Run:ai Data Volume (selon doc officielle NVIDIA docs.run.ai)
-# Transforme le PVC en ressource Data Volume Run:ai partagée pour les chercheurs
 runai:
   enabled: true
   controlPlaneUrl: "https://runai.internal.corp"

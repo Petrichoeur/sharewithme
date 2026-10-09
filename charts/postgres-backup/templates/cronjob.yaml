@@ -18,7 +18,8 @@ spec:
             {{- include "postgres-backup.selectorLabels" . | nindent 12 }}
         spec:
           restartPolicy: OnFailure
-          {{- with .Values.backupJob.pullSecrets }}
+          {{- $pullSecrets := default .Values.global.imagePullSecrets .Values.backupJob.pullSecrets }}
+          {{- with $pullSecrets }}
           imagePullSecrets:
             {{- toYaml . | nindent 12 }}
           {{- end }}

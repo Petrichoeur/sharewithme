@@ -1,28 +1,26 @@
-# Configuration du CronJob de backup PostgreSQL & Restauration
-# Adapté aux environnements Air-Gapped stricts sans build d'image personnalisé
-# Utilise des images officielles standards d'Artifactory sans aucune installation ni build
+# Global values (communes et surchargeables facilement par ArgoCD / Helm)
+global:
+  # Registry d'entreprise (Artifactory, Harbor, Quay)
+  imageRegistry: "artifactory.internal.corp"
+  # Pull Secrets globaux si nécessaire
+  imagePullSecrets: []
+  # - name: artifactory-dockercfg
 
+# Images de base standards du backup
 backupJob:
-  # Étape 1 : Image PostgreSQL standard présente dans Artifactory (contient pg_dump et pg_restore)
   postgresImage:
-    registry: "artifactory.internal.corp"
+    registry: "" # Vide pour hériter de global.imageRegistry
     repository: "docker-local/postgres"
     tag: "16-alpine"
     pullPolicy: IfNotPresent
 
-  # Étape 2 : Image S3 standard présente dans Artifactory (amazon/aws-cli, minio/mc ou curlimages/curl)
-  # Par défaut, image standard aws-cli officielle ou alpine avec curl
   s3Image:
-    registry: "artifactory.internal.corp"
+    registry: "" # Vide pour hériter de global.imageRegistry
     repository: "docker-local/aws-cli"
     tag: "latest"
     pullPolicy: IfNotPresent
 
-  pullSecrets: []
-  # - name: artifactory-dockercfg
-
 cronjob:
-  # Exécution quotidienne
   schedule: "0 2 * * *"
   concurrencyPolicy: Forbid
   successfulJobsHistoryLimit: 3
@@ -37,11 +35,10 @@ postgres:
   secretKeyRef:
     passwordKey: "postgres-password"
   password: ""
-  # Paramètres pg_dump à chaud (format custom compressé)
   pgDumpArgs: "-Fc --verbose --no-owner --no-privileges"
 
+# Configuration S3 paramétrable
 s3:
-  # Endpoint S3 interne (MinIO / Ceph / S3 interne)
   endpointUrl: "https://s3.internal.corp"
   region: "us-east-1"
   bucket: "runai-pg-backups"
@@ -50,7 +47,7 @@ s3:
   accessKeyId: ""
   secretAccessKey: ""
 
-  # Rotation Rolling : conserve strictement les 7 derniers snapshots
+  # Rotation Rolling : conserve strictement les N derniers snapshots
   rollingRotation:
     enabled: true
     maxSnapshots: 7

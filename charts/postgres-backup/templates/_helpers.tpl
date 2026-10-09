@@ -40,22 +40,24 @@ app.kubernetes.io/instance: {{ .Release.Name }}
 {{- end }}
 
 {{/*
-PostgreSQL Stock Image reference
+PostgreSQL Stock Image reference with registry resolution
 */}}
 {{- define "postgres-backup.postgresImage" -}}
-{{- if .Values.backupJob.postgresImage.registry }}
-{{- printf "%s/%s:%s" .Values.backupJob.postgresImage.registry .Values.backupJob.postgresImage.repository .Values.backupJob.postgresImage.tag }}
+{{- $registry := default (default "" .Values.global.imageRegistry) .Values.backupJob.postgresImage.registry }}
+{{- if $registry }}
+{{- printf "%s/%s:%s" $registry .Values.backupJob.postgresImage.repository .Values.backupJob.postgresImage.tag }}
 {{- else }}
 {{- printf "%s:%s" .Values.backupJob.postgresImage.repository .Values.backupJob.postgresImage.tag }}
 {{- end }}
 {{- end }}
 
 {{/*
-S3 Stock Image reference
+S3 Stock Image reference with registry resolution
 */}}
 {{- define "postgres-backup.s3Image" -}}
-{{- if .Values.backupJob.s3Image.registry }}
-{{- printf "%s/%s:%s" .Values.backupJob.s3Image.registry .Values.backupJob.s3Image.repository .Values.backupJob.s3Image.tag }}
+{{- $registry := default (default "" .Values.global.imageRegistry) .Values.backupJob.s3Image.registry }}
+{{- if $registry }}
+{{- printf "%s/%s:%s" $registry .Values.backupJob.s3Image.repository .Values.backupJob.s3Image.tag }}
 {{- else }}
 {{- printf "%s:%s" .Values.backupJob.s3Image.repository .Values.backupJob.s3Image.tag }}
 {{- end }}

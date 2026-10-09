@@ -16,7 +16,8 @@ spec:
         {{- include "runai-model-downloader.selectorLabels" . | nindent 8 }}
     spec:
       restartPolicy: Never
-      {{- with .Values.image.pullSecrets }}
+      {{- $pullSecrets := default .Values.global.imagePullSecrets .Values.image.pullSecrets }}
+      {{- with $pullSecrets }}
       imagePullSecrets:
         {{- toYaml . | nindent 8 }}
       {{- end }}

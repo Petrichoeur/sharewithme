@@ -54,13 +54,13 @@ spec:
     path: charts/postgres-backup
     helm:
       values: |
+        global:
+          imageRegistry: artifactory.internal.corp
         backupJob:
           postgresImage:
-            registry: artifactory.internal.corp
             repository: docker-local/postgres
             tag: "16-alpine"
           s3Image:
-            registry: artifactory.internal.corp
             repository: docker-local/aws-cli
             tag: "latest"
         postgres:
@@ -147,8 +147,9 @@ spec:
     path: charts/runai-model-downloader
     helm:
       values: |
+        global:
+          imageRegistry: artifactory.internal.corp
         image:
-          registry: artifactory.internal.corp
           repository: docker-local/python
           tag: "3.11-slim"
         model:

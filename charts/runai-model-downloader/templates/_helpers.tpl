@@ -40,11 +40,12 @@ app.kubernetes.io/instance: {{ .Release.Name }}
 {{- end }}
 
 {{/*
-Docker image reference with registry support
+Docker image reference with registry support (fallback on global.imageRegistry)
 */}}
 {{- define "runai-model-downloader.image" -}}
-{{- if .Values.image.registry }}
-{{- printf "%s/%s:%s" .Values.image.registry .Values.image.repository .Values.image.tag }}
+{{- $registry := default (default "" .Values.global.imageRegistry) .Values.image.registry }}
+{{- if $registry }}
+{{- printf "%s/%s:%s" $registry .Values.image.repository .Values.image.tag }}
 {{- else }}
 {{- printf "%s:%s" .Values.image.repository .Values.image.tag }}
 {{- end }}
