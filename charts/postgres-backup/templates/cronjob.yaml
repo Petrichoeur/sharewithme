@@ -78,26 +78,45 @@ spec:
                 - -c
                 - |
                   set -euo pipefail
-                  TIMESTAMP=$(date -u +%Y%m%d_%H%M%SZ)
-                  BACKUP_FILE="${PGDATABASE}_${TIMESTAMP}.dump"
-                  S3_DEST="s3://${S3_BUCKET}/${S3_PREFIX}/${BACKUP_FILE}"
-                  LATEST_DEST="s3://${S3_BUCKET}/${S3_PREFIX}/latest.dump"
 
+                  # 1. Résolution automatique de l'endpoint et du bucket depuis RAW_S3_URL
+                  # Supporte les formats :
+                  # - https://endpoint.com/mon-bucket
+                  # - s3://mon-bucket
+                  # - mon-bucket (si endpointUrl séparé)
+                  RAW_URL="${S3_URL}"
                   EXTRA_S3_ARGS=""
-                  if [ -n "${S3_ENDPOINT_URL:-}" ]; then
-                    EXTRA_S3_ARGS="${EXTRA_S3_ARGS} --endpoint-url ${S3_ENDPOINT_URL}"
+
+                  if echo "${RAW_URL}" | grep -q '^s3://'; then
+                    TARGET_BUCKET=$(echo "${RAW_URL}" | sed 's|^s3://||' | cut -d'/' -f1)
+                  elif echo "${RAW_URL}" | grep -q '^https\?://'; then
+                    PROTO=$(echo "${RAW_URL}" | grep :// | sed -e's,^\(.*://\).*,\1,g')
+                    URL_NO_PROTO=$(echo "${RAW_URL}" | sed -e "s,^$PROTO,,g")
+                    HOST_PART=$(echo "${URL_NO_PROTO}" | cut -d'/' -f1)
+                    PATH_PART=$(echo "${URL_NO_PROTO}" | cut -d'/' -f2-)
+                    
+                    if [ -n "${PATH_PART}" ] && [ "${PATH_PART}" != "${HOST_PART}" ]; then
+                      TARGET_BUCKET=$(echo "${PATH_PART}" | cut -d'/' -f1)
+                      ENDPOINT="${PROTO}${HOST_PART}"
+                    else
+                      TARGET_BUCKET="${HOST_PART}"
+                      ENDPOINT="${PROTO}${HOST_PART}"
+                    fi
+                    EXTRA_S3_ARGS="${EXTRA_S3_ARGS} --endpoint-url ${ENDPOINT}"
+                  else
+                    TARGET_BUCKET="${RAW_URL}"
                   fi
-                  if [ -n "${S3_SSE:-}" ]; then
-                    EXTRA_S3_ARGS="${EXTRA_S3_ARGS} --sse ${S3_SSE}"
-                  fi
-                  if [ -n "${S3_KMS_KEY_ID:-}" ]; then
-                    EXTRA_S3_ARGS="${EXTRA_S3_ARGS} --sse-kms-key-id ${S3_KMS_KEY_ID}"
-                  fi
+
                   if [ -n "${AWS_CA_BUNDLE:-}" ]; then
                     EXTRA_S3_ARGS="${EXTRA_S3_ARGS} --ca-bundle ${AWS_CA_BUNDLE}"
                   fi
 
-                  echo "[S3-UPLOAD] Upload vers S3 externe (${S3_DEST})..."
+                  TIMESTAMP=$(date -u +%Y%m%d_%H%M%SZ)
+                  BACKUP_FILE="${PGDATABASE}_${TIMESTAMP}.dump"
+                  S3_DEST="s3://${TARGET_BUCKET}/${S3_PREFIX}/${BACKUP_FILE}"
+                  LATEST_DEST="s3://${TARGET_BUCKET}/${S3_PREFIX}/latest.dump"
+
+                  echo "[S3-UPLOAD] Upload vers S3 externe : ${S3_DEST}..."
                   aws s3 cp /backup/db.dump "${S3_DEST}" ${EXTRA_S3_ARGS}
                   echo "[S3-UPLOAD] Upload terminé avec succès."
 
@@ -105,12 +124,12 @@ spec:
                   echo "[S3-UPLOAD] latest.dump mis à jour."
 
                   rm -f /backup/db.dump
-                  echo "[S3-UPLOAD] Fichier local nettoyé."
+                  echo "[S3-UPLOAD] Nettoyage local effectué."
 
                   {{- if .Values.s3.rollingRotation.enabled }}
                   MAX_KEEP={{ .Values.s3.rollingRotation.maxSnapshots | default 7 }}
                   echo "[S3-UPLOAD] Rotation Rolling : conservation des ${MAX_KEEP} derniers snapshots..."
-                  ALL_SNAPSHOTS=$(aws s3 ls "s3://${S3_BUCKET}/${S3_PREFIX}/" ${EXTRA_S3_ARGS} | \
+                  ALL_SNAPSHOTS=$(aws s3 ls "s3://${TARGET_BUCKET}/${S3_PREFIX}/" ${EXTRA_S3_ARGS} | \
                     awk '{print $4}' | grep '\.dump$' | grep -v '^latest\.dump$' | sort)
                   
                   TOTAL_COUNT=$(echo "${ALL_SNAPSHOTS}" | grep -c . || true)
@@ -119,7 +138,7 @@ spec:
                     echo "${ALL_SNAPSHOTS}" | head -n "${NB_TO_DELETE}" | while read -r OLD_FILE; do
                       if [ -n "${OLD_FILE}" ]; then
                         echo "[-] Suppression S3 : ${OLD_FILE}"
-                        aws s3 rm "s3://${S3_BUCKET}/${S3_PREFIX}/${OLD_FILE}" ${EXTRA_S3_ARGS}
+                        aws s3 rm "s3://${TARGET_BUCKET}/${S3_PREFIX}/${OLD_FILE}" ${EXTRA_S3_ARGS}
                       fi
                     done
                   fi
@@ -128,6 +147,12 @@ spec:
               env:
                 - name: PGDATABASE
                   value: {{ .Values.postgres.database | quote }}
+                - name: S3_URL
+                  value: {{ .Values.s3.url | quote }}
+                - name: S3_PREFIX
+                  value: {{ .Values.s3.prefix | quote }}
+                - name: AWS_DEFAULT_REGION
+                  value: {{ .Values.s3.region | quote }}
                 - name: AWS_ACCESS_KEY_ID
                   valueFrom:
                     secretKeyRef:
@@ -138,24 +163,6 @@ spec:
                     secretKeyRef:
                       name: {{ default (printf "%s-s3-secret" (include "postgres-backup.fullname" .)) .Values.s3.existingSecret }}
                       key: {{ .Values.s3.secretKeyRef.secretAccessKeyKey }}
-                - name: AWS_DEFAULT_REGION
-                  value: {{ .Values.s3.region | quote }}
-                - name: S3_BUCKET
-                  value: {{ .Values.s3.bucket | quote }}
-                - name: S3_PREFIX
-                  value: {{ .Values.s3.prefix | quote }}
-                {{- if .Values.s3.endpointUrl }}
-                - name: S3_ENDPOINT_URL
-                  value: {{ .Values.s3.endpointUrl | quote }}
-                {{- end }}
-                {{- if .Values.s3.serverSideEncryption }}
-                - name: S3_SSE
-                  value: {{ .Values.s3.serverSideEncryption | quote }}
-                {{- end }}
-                {{- if .Values.s3.kmsKeyId }}
-                - name: S3_KMS_KEY_ID
-                  value: {{ .Values.s3.kmsKeyId | quote }}
-                {{- end }}
                 {{- if .Values.s3.proxy.httpProxy }}
                 - name: HTTP_PROXY
                   value: {{ .Values.s3.proxy.httpProxy | quote }}

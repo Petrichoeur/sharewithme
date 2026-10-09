@@ -70,13 +70,12 @@ spec:
           secretKeyRef:
             passwordKey: postgres-password
         s3:
-          # Laisser endpointUrl vide si AWS S3 officiel, ou spécifier si passerelle/endpoint externe dédié
-          endpointUrl: ""
-          region: eu-west-3
-          bucket: runai-backups-externe
-          prefix: postgres-prod
-          existingSecret: s3-credentials
-          # Proxy d'entreprise sortant si nécessaire pour joindre le S3 externe depuis l'on-premise :
+          # URL complète fournie par les équipes (ex: https://s3.eu-west-3.amazonaws.com/mon-bucket ou https://mon-s3.corp/mon-bucket)
+          url: "https://s3.eu-west-3.amazonaws.com/runai-pg-backups"
+          # Nom du Secret K8s existant fourni par les équipes
+          existingSecret: "s3-credentials"
+          prefix: "postgres-prod"
+          # Proxy d'entreprise si nécessaire pour sortir du on-premise :
           # proxy:
           #   httpsProxy: "http://proxy.internal.corp:3128"
           rollingRotation:

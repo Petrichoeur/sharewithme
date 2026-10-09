@@ -45,24 +45,49 @@ spec:
             - |
               set -euo pipefail
               TARGET_FILE="{{ .Values.restore.dumpFile }}"
+              RAW_URL="${S3_URL}"
               EXTRA_S3_ARGS=""
-              if [ -n "${S3_ENDPOINT_URL:-}" ]; then
-                EXTRA_S3_ARGS="${EXTRA_S3_ARGS} --endpoint-url ${S3_ENDPOINT_URL}"
+
+              if echo "${RAW_URL}" | grep -q '^s3://'; then
+                TARGET_BUCKET=$(echo "${RAW_URL}" | sed 's|^s3://||' | cut -d'/' -f1)
+              elif echo "${RAW_URL}" | grep -q '^https\?://'; then
+                PROTO=$(echo "${RAW_URL}" | grep :// | sed -e's,^\(.*://\).*,\1,g')
+                URL_NO_PROTO=$(echo "${RAW_URL}" | sed -e "s,^$PROTO,,g")
+                HOST_PART=$(echo "${URL_NO_PROTO}" | cut -d'/' -f1)
+                PATH_PART=$(echo "${URL_NO_PROTO}" | cut -d'/' -f2-)
+                
+                if [ -n "${PATH_PART}" ] && [ "${PATH_PART}" != "${HOST_PART}" ]; then
+                  TARGET_BUCKET=$(echo "${PATH_PART}" | cut -d'/' -f1)
+                  ENDPOINT="${PROTO}${HOST_PART}"
+                else
+                  TARGET_BUCKET="${HOST_PART}"
+                  ENDPOINT="${PROTO}${HOST_PART}"
+                fi
+                EXTRA_S3_ARGS="${EXTRA_S3_ARGS} --endpoint-url ${ENDPOINT}"
+              else
+                TARGET_BUCKET="${RAW_URL}"
               fi
+
               if [ -n "${AWS_CA_BUNDLE:-}" ]; then
                 EXTRA_S3_ARGS="${EXTRA_S3_ARGS} --ca-bundle ${AWS_CA_BUNDLE}"
               fi
 
               if [ "$TARGET_FILE" = "latest" ]; then
-                S3_SOURCE="s3://${S3_BUCKET}/${S3_PREFIX}/latest.dump"
+                S3_SOURCE="s3://${TARGET_BUCKET}/${S3_PREFIX}/latest.dump"
               else
-                S3_SOURCE="s3://${S3_BUCKET}/${S3_PREFIX}/${TARGET_FILE}"
+                S3_SOURCE="s3://${TARGET_BUCKET}/${S3_PREFIX}/${TARGET_FILE}"
               fi
 
               echo "[RESTORE-DOWNLOAD] Téléchargement depuis S3 externe (${S3_SOURCE})..."
               aws s3 cp "${S3_SOURCE}" /restore/db.dump ${EXTRA_S3_ARGS}
               echo "[RESTORE-DOWNLOAD] Fichier récupéré avec succès ($(du -h /restore/db.dump | awk '{print $1}'))."
           env:
+            - name: S3_URL
+              value: {{ .Values.s3.url | quote }}
+            - name: S3_PREFIX
+              value: {{ .Values.s3.prefix | quote }}
+            - name: AWS_DEFAULT_REGION
+              value: {{ .Values.s3.region | quote }}
             - name: AWS_ACCESS_KEY_ID
               valueFrom:
                 secretKeyRef:
@@ -73,16 +98,6 @@ spec:
                 secretKeyRef:
                   name: {{ default (printf "%s-s3-secret" (include "postgres-backup.fullname" .)) .Values.s3.existingSecret }}
                   key: {{ .Values.s3.secretKeyRef.secretAccessKeyKey }}
-            - name: AWS_DEFAULT_REGION
-              value: {{ .Values.s3.region | quote }}
-            - name: S3_BUCKET
-              value: {{ .Values.s3.bucket | quote }}
-            - name: S3_PREFIX
-              value: {{ .Values.s3.prefix | quote }}
-            {{- if .Values.s3.endpointUrl }}
-            - name: S3_ENDPOINT_URL
-              value: {{ .Values.s3.endpointUrl | quote }}
-            {{- end }}
             {{- if .Values.s3.proxy.httpProxy }}
             - name: HTTP_PROXY
               value: {{ .Values.s3.proxy.httpProxy | quote }}

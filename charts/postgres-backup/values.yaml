@@ -1,12 +1,9 @@
 # Global values (communes et surchargeables facilement par ArgoCD / Helm)
 global:
-  # Registry d'entreprise interne (Artifactory, Harbor, Quay)
   imageRegistry: "artifactory.internal.corp"
-  # Pull Secrets globaux si nécessaire
   imagePullSecrets: []
   # - name: artifactory-dockercfg
 
-# Images de base standards du backup
 backupJob:
   postgresImage:
     registry: "" # Vide pour hériter de global.imageRegistry
@@ -37,38 +34,39 @@ postgres:
   password: ""
   pgDumpArgs: "-Fc --verbose --no-owner --no-privileges"
 
-# Configuration S3 externe (ex: AWS S3, Cloud Provider, ou stockage objet distant)
+# ==============================================================================
+# S3 EXTERNE : Vous n'avez qu'à renseigner l'URL et le SECRET fourni par les équipes !
+# ==============================================================================
 s3:
-  # Laisser endpointUrl vide pour AWS S3 public officiel (ex: s3.eu-west-3.amazonaws.com)
-  # Ou renseigner l'URL si endpoint dédié/proxy : "https://s3.eu-west-3.amazonaws.com"
-  endpointUrl: ""
-  region: "eu-west-3"
-  bucket: "mon-bucket-s3-externe"
+  # URL complète fournie par les équipes (ex: https://s3-externe.company.com/mon-bucket ou https://s3.eu-west-3.amazonaws.com/mon-bucket)
+  # Si l'URL contient déjà le bucket (ex: https://endpoint/mon-bucket), le chart extrait automatiquement l'endpoint et le bucket.
+  url: "https://s3.eu-west-3.amazonaws.com/runai-pg-backups"
+
+  # Nom du Secret K8s existant fourni par les équipes
+  existingSecret: "s3-credentials"
+
+  # Clés dans le Secret existant (avec fallbacks automatiques pour s'adapter au format des équipes)
+  secretKeyRef:
+    accessKeyIdKey: "AWS_ACCESS_KEY_ID"         # ou "access-key", "AWS_ACCESS_KEY", "access_key_id"
+    secretAccessKeyKey: "AWS_SECRET_ACCESS_KEY" # ou "secret-key", "AWS_SECRET_KEY", "secret_access_key"
+
+  # Préfixe / dossier dans le bucket
   prefix: "postgres-runai-prod"
 
-  # Secret contenant les clés AWS (recommandé pour la prod)
-  existingSecret: ""
-  secretKeyRef:
-    accessKeyIdKey: "aws-access-key-id"
-    secretAccessKeyKey: "aws-secret-access-key"
-  accessKeyId: ""
-  secretAccessKey: ""
+  # Région par défaut (us-east-1 standard compatible tout S3, ou région spécifique)
+  region: "us-east-1"
 
-  # Proxy HTTPS sortant si le cluster on-premise doit traverser un proxy d'entreprise
+  # Proxy d'entreprise sortant si votre OpenShift on-premise doit traverser un proxy pour sortir vers ce S3 externe
   proxy:
-    httpProxy: ""   # ex: "http://proxy.internal.corp:3128"
-    httpsProxy: ""  # ex: "http://proxy.internal.corp:3128"
+    httpProxy: ""
+    httpsProxy: ""
     noProxy: "localhost,127.0.0.1,.svc,.cluster.local"
 
-  # Certificat TLS d'entreprise / Proxy CA (si interception TLS par le proxy sortant)
+  # Certificat CA d'entreprise si proxy avec interception TLS
   customCa:
     enabled: false
     configMapName: "corp-root-ca"
     caKey: "ca.crt"
-
-  # Chiffrement côté serveur S3 (ex: "AES256" ou "aws:kms")
-  serverSideEncryption: ""
-  kmsKeyId: ""
 
   # Rotation Rolling : conserve strictement les N derniers snapshots
   rollingRotation:
