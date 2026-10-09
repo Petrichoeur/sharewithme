@@ -30,8 +30,13 @@ spec:
           volumes:
             - name: backup-storage
               emptyDir: {}
+            {{- if .Values.s3.customCa.enabled }}
+            - name: custom-ca
+              configMap:
+                name: {{ .Values.s3.customCa.configMapName }}
+            {{- end }}
           initContainers:
-            # ÉTAPE 1 (SÉQUENTIELLE) : pg_dump écrit le fichier compressé sur le volume temporaire
+            # ÉTAPE 1 (ON-PREM) : pg_dump écrit le snapshot compressé sur le stockage temporaire
             - name: pg-dump
               image: {{ include "postgres-backup.postgresImage" . | quote }}
               imagePullPolicy: {{ .Values.backupJob.postgresImage.pullPolicy }}
@@ -64,7 +69,7 @@ spec:
                 {{- toYaml .Values.resources | nindent 16 }}
 
           containers:
-            # ÉTAPE 2 (SÉQUENTIELLE) : aws-cli envoie vers S3, met à jour latest.dump et purge le local + rotation rolling S3
+            # ÉTAPE 2 (SORTIE S3 EXTERNE) : aws-cli envoie vers le S3 externe
             - name: s3-upload
               image: {{ include "postgres-backup.s3Image" . | quote }}
               imagePullPolicy: {{ .Values.backupJob.s3Image.pullPolicy }}
@@ -80,19 +85,27 @@ spec:
 
                   EXTRA_S3_ARGS=""
                   if [ -n "${S3_ENDPOINT_URL:-}" ]; then
-                    EXTRA_S3_ARGS="--endpoint-url ${S3_ENDPOINT_URL}"
+                    EXTRA_S3_ARGS="${EXTRA_S3_ARGS} --endpoint-url ${S3_ENDPOINT_URL}"
+                  fi
+                  if [ -n "${S3_SSE:-}" ]; then
+                    EXTRA_S3_ARGS="${EXTRA_S3_ARGS} --sse ${S3_SSE}"
+                  fi
+                  if [ -n "${S3_KMS_KEY_ID:-}" ]; then
+                    EXTRA_S3_ARGS="${EXTRA_S3_ARGS} --sse-kms-key-id ${S3_KMS_KEY_ID}"
+                  fi
+                  if [ -n "${AWS_CA_BUNDLE:-}" ]; then
+                    EXTRA_S3_ARGS="${EXTRA_S3_ARGS} --ca-bundle ${AWS_CA_BUNDLE}"
                   fi
 
-                  echo "[S3-UPLOAD] Upload vers S3 (${S3_DEST})..."
+                  echo "[S3-UPLOAD] Upload vers S3 externe (${S3_DEST})..."
                   aws s3 cp /backup/db.dump "${S3_DEST}" ${EXTRA_S3_ARGS}
                   echo "[S3-UPLOAD] Upload terminé avec succès."
 
                   aws s3 cp "${S3_DEST}" "${LATEST_DEST}" ${EXTRA_S3_ARGS}
                   echo "[S3-UPLOAD] latest.dump mis à jour."
 
-                  # Nettoyage immédiat du fichier temporaire du Pod
                   rm -f /backup/db.dump
-                  echo "[S3-UPLOAD] Nettoyage local effectué."
+                  echo "[S3-UPLOAD] Fichier local nettoyé."
 
                   {{- if .Values.s3.rollingRotation.enabled }}
                   MAX_KEEP={{ .Values.s3.rollingRotation.maxSnapshots | default 7 }}
@@ -119,22 +132,60 @@ spec:
                   valueFrom:
                     secretKeyRef:
                       name: {{ default (printf "%s-s3-secret" (include "postgres-backup.fullname" .)) .Values.s3.existingSecret }}
-                      key: aws-access-key-id
+                      key: {{ .Values.s3.secretKeyRef.accessKeyIdKey }}
                 - name: AWS_SECRET_ACCESS_KEY
                   valueFrom:
                     secretKeyRef:
                       name: {{ default (printf "%s-s3-secret" (include "postgres-backup.fullname" .)) .Values.s3.existingSecret }}
-                      key: aws-secret-access-key
+                      key: {{ .Values.s3.secretKeyRef.secretAccessKeyKey }}
                 - name: AWS_DEFAULT_REGION
                   value: {{ .Values.s3.region | quote }}
                 - name: S3_BUCKET
                   value: {{ .Values.s3.bucket | quote }}
                 - name: S3_PREFIX
                   value: {{ .Values.s3.prefix | quote }}
+                {{- if .Values.s3.endpointUrl }}
                 - name: S3_ENDPOINT_URL
                   value: {{ .Values.s3.endpointUrl | quote }}
+                {{- end }}
+                {{- if .Values.s3.serverSideEncryption }}
+                - name: S3_SSE
+                  value: {{ .Values.s3.serverSideEncryption | quote }}
+                {{- end }}
+                {{- if .Values.s3.kmsKeyId }}
+                - name: S3_KMS_KEY_ID
+                  value: {{ .Values.s3.kmsKeyId | quote }}
+                {{- end }}
+                {{- if .Values.s3.proxy.httpProxy }}
+                - name: HTTP_PROXY
+                  value: {{ .Values.s3.proxy.httpProxy | quote }}
+                - name: http_proxy
+                  value: {{ .Values.s3.proxy.httpProxy | quote }}
+                {{- end }}
+                {{- if .Values.s3.proxy.httpsProxy }}
+                - name: HTTPS_PROXY
+                  value: {{ .Values.s3.proxy.httpsProxy | quote }}
+                - name: https_proxy
+                  value: {{ .Values.s3.proxy.httpsProxy | quote }}
+                {{- end }}
+                {{- if .Values.s3.proxy.noProxy }}
+                - name: NO_PROXY
+                  value: {{ .Values.s3.proxy.noProxy | quote }}
+                - name: no_proxy
+                  value: {{ .Values.s3.proxy.noProxy | quote }}
+                {{- end }}
+                {{- if .Values.s3.customCa.enabled }}
+                - name: AWS_CA_BUNDLE
+                  value: "/etc/ssl/certs/s3-ca.crt"
+                {{- end }}
               volumeMounts:
                 - name: backup-storage
                   mountPath: /backup
+                {{- if .Values.s3.customCa.enabled }}
+                - name: custom-ca
+                  mountPath: /etc/ssl/certs/s3-ca.crt
+                  subPath: {{ .Values.s3.customCa.caKey }}
+                  readOnly: true
+                {{- end }}
               resources:
                 {{- toYaml .Values.resources | nindent 16 }}

@@ -1,6 +1,6 @@
 # Global values (communes et surchargeables facilement par ArgoCD / Helm)
 global:
-  # Registry d'entreprise (Artifactory, Harbor, Quay)
+  # Registry d'entreprise interne (Artifactory, Harbor, Quay)
   imageRegistry: "artifactory.internal.corp"
   # Pull Secrets globaux si nécessaire
   imagePullSecrets: []
@@ -37,15 +37,38 @@ postgres:
   password: ""
   pgDumpArgs: "-Fc --verbose --no-owner --no-privileges"
 
-# Configuration S3 paramétrable
+# Configuration S3 externe (ex: AWS S3, Cloud Provider, ou stockage objet distant)
 s3:
-  endpointUrl: "https://s3.internal.corp"
-  region: "us-east-1"
-  bucket: "runai-pg-backups"
-  prefix: "postgres-runai"
+  # Laisser endpointUrl vide pour AWS S3 public officiel (ex: s3.eu-west-3.amazonaws.com)
+  # Ou renseigner l'URL si endpoint dédié/proxy : "https://s3.eu-west-3.amazonaws.com"
+  endpointUrl: ""
+  region: "eu-west-3"
+  bucket: "mon-bucket-s3-externe"
+  prefix: "postgres-runai-prod"
+
+  # Secret contenant les clés AWS (recommandé pour la prod)
   existingSecret: ""
+  secretKeyRef:
+    accessKeyIdKey: "aws-access-key-id"
+    secretAccessKeyKey: "aws-secret-access-key"
   accessKeyId: ""
   secretAccessKey: ""
+
+  # Proxy HTTPS sortant si le cluster on-premise doit traverser un proxy d'entreprise
+  proxy:
+    httpProxy: ""   # ex: "http://proxy.internal.corp:3128"
+    httpsProxy: ""  # ex: "http://proxy.internal.corp:3128"
+    noProxy: "localhost,127.0.0.1,.svc,.cluster.local"
+
+  # Certificat TLS d'entreprise / Proxy CA (si interception TLS par le proxy sortant)
+  customCa:
+    enabled: false
+    configMapName: "corp-root-ca"
+    caKey: "ca.crt"
+
+  # Chiffrement côté serveur S3 (ex: "AES256" ou "aws:kms")
+  serverSideEncryption: ""
+  kmsKeyId: ""
 
   # Rotation Rolling : conserve strictement les N derniers snapshots
   rollingRotation:

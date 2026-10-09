@@ -29,8 +29,13 @@ spec:
       volumes:
         - name: restore-storage
           emptyDir: {}
+        {{- if .Values.s3.customCa.enabled }}
+        - name: custom-ca
+          configMap:
+            name: {{ .Values.s3.customCa.configMapName }}
+        {{- end }}
       initContainers:
-        # ÉTAPE 1 (SÉQUENTIELLE) : aws-cli télécharge le dump depuis S3 vers le stockage temporaire
+        # ÉTAPE 1 (S3 EXTERNE -> ON-PREMISE) : aws-cli télécharge depuis le S3 externe
         - name: s3-download
           image: {{ include "postgres-backup.s3Image" . | quote }}
           imagePullPolicy: {{ .Values.backupJob.s3Image.pullPolicy }}
@@ -42,7 +47,10 @@ spec:
               TARGET_FILE="{{ .Values.restore.dumpFile }}"
               EXTRA_S3_ARGS=""
               if [ -n "${S3_ENDPOINT_URL:-}" ]; then
-                EXTRA_S3_ARGS="--endpoint-url ${S3_ENDPOINT_URL}"
+                EXTRA_S3_ARGS="${EXTRA_S3_ARGS} --endpoint-url ${S3_ENDPOINT_URL}"
+              fi
+              if [ -n "${AWS_CA_BUNDLE:-}" ]; then
+                EXTRA_S3_ARGS="${EXTRA_S3_ARGS} --ca-bundle ${AWS_CA_BUNDLE}"
               fi
 
               if [ "$TARGET_FILE" = "latest" ]; then
@@ -51,7 +59,7 @@ spec:
                 S3_SOURCE="s3://${S3_BUCKET}/${S3_PREFIX}/${TARGET_FILE}"
               fi
 
-              echo "[RESTORE-DOWNLOAD] Téléchargement depuis ${S3_SOURCE}..."
+              echo "[RESTORE-DOWNLOAD] Téléchargement depuis S3 externe (${S3_SOURCE})..."
               aws s3 cp "${S3_SOURCE}" /restore/db.dump ${EXTRA_S3_ARGS}
               echo "[RESTORE-DOWNLOAD] Fichier récupéré avec succès ($(du -h /restore/db.dump | awk '{print $1}'))."
           env:
@@ -59,28 +67,58 @@ spec:
               valueFrom:
                 secretKeyRef:
                   name: {{ default (printf "%s-s3-secret" (include "postgres-backup.fullname" .)) .Values.s3.existingSecret }}
-                  key: aws-access-key-id
+                  key: {{ .Values.s3.secretKeyRef.accessKeyIdKey }}
             - name: AWS_SECRET_ACCESS_KEY
               valueFrom:
                 secretKeyRef:
                   name: {{ default (printf "%s-s3-secret" (include "postgres-backup.fullname" .)) .Values.s3.existingSecret }}
-                  key: aws-secret-access-key
+                  key: {{ .Values.s3.secretKeyRef.secretAccessKeyKey }}
             - name: AWS_DEFAULT_REGION
               value: {{ .Values.s3.region | quote }}
             - name: S3_BUCKET
               value: {{ .Values.s3.bucket | quote }}
             - name: S3_PREFIX
               value: {{ .Values.s3.prefix | quote }}
+            {{- if .Values.s3.endpointUrl }}
             - name: S3_ENDPOINT_URL
               value: {{ .Values.s3.endpointUrl | quote }}
+            {{- end }}
+            {{- if .Values.s3.proxy.httpProxy }}
+            - name: HTTP_PROXY
+              value: {{ .Values.s3.proxy.httpProxy | quote }}
+            - name: http_proxy
+              value: {{ .Values.s3.proxy.httpProxy | quote }}
+            {{- end }}
+            {{- if .Values.s3.proxy.httpsProxy }}
+            - name: HTTPS_PROXY
+              value: {{ .Values.s3.proxy.httpsProxy | quote }}
+            - name: https_proxy
+              value: {{ .Values.s3.proxy.httpsProxy | quote }}
+            {{- end }}
+            {{- if .Values.s3.proxy.noProxy }}
+            - name: NO_PROXY
+              value: {{ .Values.s3.proxy.noProxy | quote }}
+            - name: no_proxy
+              value: {{ .Values.s3.proxy.noProxy | quote }}
+            {{- end }}
+            {{- if .Values.s3.customCa.enabled }}
+            - name: AWS_CA_BUNDLE
+              value: "/etc/ssl/certs/s3-ca.crt"
+            {{- end }}
           volumeMounts:
             - name: restore-storage
               mountPath: /restore
+            {{- if .Values.s3.customCa.enabled }}
+            - name: custom-ca
+              mountPath: /etc/ssl/certs/s3-ca.crt
+              subPath: {{ .Values.s3.customCa.caKey }}
+              readOnly: true
+            {{- end }}
           resources:
             {{- toYaml .Values.resources | nindent 12 }}
 
       containers:
-        # ÉTAPE 2 (SÉQUENTIELLE) : pg_restore restaure la base depuis le fichier téléchargé
+        # ÉTAPE 2 (ON-PREMISE) : pg_restore applique le dump sur la base locale de prod
         - name: pg-restore
           image: {{ include "postgres-backup.postgresImage" . | quote }}
           imagePullPolicy: {{ .Values.backupJob.postgresImage.pullPolicy }}
