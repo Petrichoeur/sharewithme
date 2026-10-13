@@ -6,193 +6,135 @@ metadata:
     {{- include "postgres-backup.labels" . | nindent 4 }}
 spec:
   schedule: {{ .Values.cronjob.schedule | quote }}
+  {{- with .Values.cronjob.timeZone }}
+  timeZone: {{ . | quote }}
+  {{- end }}
   concurrencyPolicy: {{ .Values.cronjob.concurrencyPolicy }}
+  startingDeadlineSeconds: {{ .Values.cronjob.startingDeadlineSeconds }}
   successfulJobsHistoryLimit: {{ .Values.cronjob.successfulJobsHistoryLimit }}
   failedJobsHistoryLimit: {{ .Values.cronjob.failedJobsHistoryLimit }}
   jobTemplate:
     spec:
-      backoffLimit: 2
+      backoffLimit: {{ .Values.cronjob.backoffLimit }}
+      activeDeadlineSeconds: {{ .Values.cronjob.activeDeadlineSeconds }}
       template:
         metadata:
           labels:
             {{- include "postgres-backup.selectorLabels" . | nindent 12 }}
+            app.kubernetes.io/component: backup
         spec:
-          restartPolicy: OnFailure
-          {{- $pullSecrets := default .Values.global.imagePullSecrets .Values.backupJob.pullSecrets }}
-          {{- with $pullSecrets }}
-          imagePullSecrets:
-            {{- toYaml . | nindent 12 }}
-          {{- end }}
+          restartPolicy: Never
+          {{- include "postgres-backup.pullSecrets" . | nindent 10 }}
           {{- with .Values.securityContext }}
           securityContext:
             {{- toYaml . | nindent 12 }}
           {{- end }}
           volumes:
-            - name: backup-storage
-              emptyDir: {}
-            {{- if .Values.s3.customCa.enabled }}
-            - name: custom-ca
-              configMap:
-                name: {{ .Values.s3.customCa.configMapName }}
-            {{- end }}
+            - name: work
+              emptyDir:
+                sizeLimit: {{ .Values.workVolume.sizeLimit }}
+            {{- include "postgres-backup.s3Volumes" . | nindent 12 }}
+
           initContainers:
-            # ÉTAPE 1 (ON-PREM) : pg_dump écrit le snapshot compressé sur le stockage temporaire
+            # 1) pg_dump : rôles + chaque base, contrôle d'intégrité de chaque archive
             - name: pg-dump
               image: {{ include "postgres-backup.postgresImage" . | quote }}
               imagePullPolicy: {{ .Values.backupJob.postgresImage.pullPolicy }}
-              command:
-                - /bin/sh
-                - -c
+              {{- with .Values.containerSecurityContext }}
+              securityContext:
+                {{- toYaml . | nindent 16 }}
+              {{- end }}
+              command: ["/bin/sh", "-c"]
+              args:
                 - |
                   set -euo pipefail
-                  echo "[PG-DUMP] Démarrage du dump à chaud (${PGHOST}:${PGPORT} / base: ${PGDATABASE})..."
-                  pg_dump -h "${PGHOST}" -p "${PGPORT}" -U "${PGUSER}" -d "${PGDATABASE}" {{ .Values.postgres.pgDumpArgs }} -f /backup/db.dump
-                  echo "[PG-DUMP] Dump terminé avec succès ($(du -h /backup/db.dump | awk '{print $1}'))."
+                  TS=$(date -u +%Y%m%dT%H%M%SZ)
+                  OUT="/work/${TS}"
+                  mkdir -p "${OUT}"
+
+                  if [ -n "${PG_DATABASES}" ]; then
+                    DBS="${PG_DATABASES}"
+                  else
+                    DBS=$(psql -d postgres -AtX -c "SELECT datname FROM pg_database WHERE datallowconn AND NOT datistemplate ORDER BY datname")
+                  fi
+                  [ -n "${DBS}" ] || { echo "[ERREUR] Aucune base à sauvegarder"; exit 1; }
+                  echo "[INFO] Bases à sauvegarder : $(echo ${DBS})"
+
+                  echo "[INFO] Export des rôles (pg_dumpall --globals-only)"
+                  pg_dumpall -l postgres --globals-only -f "${OUT}/globals.sql"
+
+                  for DB in ${DBS}; do
+                    echo "[INFO] pg_dump ${DB}"
+                    pg_dump -d "${DB}" {{ .Values.postgres.pgDumpArgs }} -f "${OUT}/${DB}.dump"
+                    pg_restore --list "${OUT}/${DB}.dump" > /dev/null
+                    echo "[OK] ${DB} : $(du -h "${OUT}/${DB}.dump" | cut -f1) (archive vérifiée)"
+                  done
+
+                  echo "${TS}" > /work/TIMESTAMP
               env:
-                - name: PGHOST
-                  value: {{ .Values.postgres.host | quote }}
-                - name: PGPORT
-                  value: {{ .Values.postgres.port | quote }}
-                - name: PGDATABASE
-                  value: {{ .Values.postgres.database | quote }}
-                - name: PGUSER
-                  value: {{ .Values.postgres.username | quote }}
-                - name: PGPASSWORD
-                  valueFrom:
-                    secretKeyRef:
-                      name: {{ default (printf "%s-pg-secret" (include "postgres-backup.fullname" .)) .Values.postgres.existingSecret }}
-                      key: {{ .Values.postgres.secretKeyRef.passwordKey }}
+                {{- include "postgres-backup.pgEnv" . | nindent 16 }}
+                - name: PG_DATABASES
+                  value: {{ join " " .Values.postgres.databases | quote }}
               volumeMounts:
-                - name: backup-storage
-                  mountPath: /backup
+                - name: work
+                  mountPath: /work
               resources:
                 {{- toYaml .Values.resources | nindent 16 }}
 
           containers:
-            # ÉTAPE 2 (SORTIE S3 EXTERNE) : aws-cli envoie vers le S3 externe
+            # 2) Envoi S3 + vérification + pointeur LATEST + rotation
             - name: s3-upload
               image: {{ include "postgres-backup.s3Image" . | quote }}
               imagePullPolicy: {{ .Values.backupJob.s3Image.pullPolicy }}
-              command:
-                - /bin/sh
-                - -c
+              {{- with .Values.containerSecurityContext }}
+              securityContext:
+                {{- toYaml . | nindent 16 }}
+              {{- end }}
+              command: ["/bin/sh", "-c"]
+              args:
                 - |
                   set -euo pipefail
+                  s3() { aws --endpoint-url "${S3_ENDPOINT}" s3 "$@"; }
 
-                  # 1. Résolution automatique de l'endpoint et du bucket depuis RAW_S3_URL
-                  # Supporte les formats :
-                  # - https://endpoint.com/mon-bucket
-                  # - s3://mon-bucket
-                  # - mon-bucket (si endpointUrl séparé)
-                  RAW_URL="${S3_URL}"
-                  EXTRA_S3_ARGS=""
+                  TS=$(cat /work/TIMESTAMP)
+                  BASE="s3://${S3_BUCKET}/${S3_PREFIX}"
 
-                  if echo "${RAW_URL}" | grep -q '^s3://'; then
-                    TARGET_BUCKET=$(echo "${RAW_URL}" | sed 's|^s3://||' | cut -d'/' -f1)
-                  elif echo "${RAW_URL}" | grep -q '^https\?://'; then
-                    PROTO=$(echo "${RAW_URL}" | grep :// | sed -e's,^\(.*://\).*,\1,g')
-                    URL_NO_PROTO=$(echo "${RAW_URL}" | sed -e "s,^$PROTO,,g")
-                    HOST_PART=$(echo "${URL_NO_PROTO}" | cut -d'/' -f1)
-                    PATH_PART=$(echo "${URL_NO_PROTO}" | cut -d'/' -f2-)
-                    
-                    if [ -n "${PATH_PART}" ] && [ "${PATH_PART}" != "${HOST_PART}" ]; then
-                      TARGET_BUCKET=$(echo "${PATH_PART}" | cut -d'/' -f1)
-                      ENDPOINT="${PROTO}${HOST_PART}"
-                    else
-                      TARGET_BUCKET="${HOST_PART}"
-                      ENDPOINT="${PROTO}${HOST_PART}"
-                    fi
-                    EXTRA_S3_ARGS="${EXTRA_S3_ARGS} --endpoint-url ${ENDPOINT}"
-                  else
-                    TARGET_BUCKET="${RAW_URL}"
+                  echo "[INFO] Envoi vers ${BASE}/${TS}/"
+                  s3 cp "/work/${TS}/" "${BASE}/${TS}/" --recursive --only-show-errors
+
+                  LOCAL=$(ls -1 "/work/${TS}" | wc -l)
+                  REMOTE=$(s3 ls "${BASE}/${TS}/" | wc -l)
+                  if [ "${LOCAL}" -ne "${REMOTE}" ]; then
+                    echo "[ERREUR] ${REMOTE} fichier(s) sur S3 pour ${LOCAL} attendu(s)"
+                    exit 1
                   fi
+                  echo "[OK] ${LOCAL} fichier(s) envoyé(s) et vérifié(s)"
 
-                  if [ -n "${AWS_CA_BUNDLE:-}" ]; then
-                    EXTRA_S3_ARGS="${EXTRA_S3_ARGS} --ca-bundle ${AWS_CA_BUNDLE}"
-                  fi
-
-                  TIMESTAMP=$(date -u +%Y%m%d_%H%M%SZ)
-                  BACKUP_FILE="${PGDATABASE}_${TIMESTAMP}.dump"
-                  S3_DEST="s3://${TARGET_BUCKET}/${S3_PREFIX}/${BACKUP_FILE}"
-                  LATEST_DEST="s3://${TARGET_BUCKET}/${S3_PREFIX}/latest.dump"
-
-                  echo "[S3-UPLOAD] Upload vers S3 externe : ${S3_DEST}..."
-                  aws s3 cp /backup/db.dump "${S3_DEST}" ${EXTRA_S3_ARGS}
-                  echo "[S3-UPLOAD] Upload terminé avec succès."
-
-                  aws s3 cp "${S3_DEST}" "${LATEST_DEST}" ${EXTRA_S3_ARGS}
-                  echo "[S3-UPLOAD] latest.dump mis à jour."
-
-                  rm -f /backup/db.dump
-                  echo "[S3-UPLOAD] Nettoyage local effectué."
+                  echo "${TS}" > /tmp/LATEST
+                  s3 cp /tmp/LATEST "${BASE}/LATEST" --only-show-errors
+                  rm -rf "/work/${TS}"
 
                   {{- if .Values.s3.rollingRotation.enabled }}
-                  MAX_KEEP={{ .Values.s3.rollingRotation.maxSnapshots | default 7 }}
-                  echo "[S3-UPLOAD] Rotation Rolling : conservation des ${MAX_KEEP} derniers snapshots..."
-                  ALL_SNAPSHOTS=$(aws s3 ls "s3://${TARGET_BUCKET}/${S3_PREFIX}/" ${EXTRA_S3_ARGS} | \
-                    awk '{print $4}' | grep '\.dump$' | grep -v '^latest\.dump$' | sort)
-                  
-                  TOTAL_COUNT=$(echo "${ALL_SNAPSHOTS}" | grep -c . || true)
-                  if [ "${TOTAL_COUNT}" -gt "${MAX_KEEP}" ]; then
-                    NB_TO_DELETE=$(( TOTAL_COUNT - MAX_KEEP ))
-                    echo "${ALL_SNAPSHOTS}" | head -n "${NB_TO_DELETE}" | while read -r OLD_FILE; do
-                      if [ -n "${OLD_FILE}" ]; then
-                        echo "[-] Suppression S3 : ${OLD_FILE}"
-                        aws s3 rm "s3://${TARGET_BUCKET}/${S3_PREFIX}/${OLD_FILE}" ${EXTRA_S3_ARGS}
-                      fi
+                  MAX={{ .Values.s3.rollingRotation.maxSnapshots | int }}
+                  # Seuls les dossiers au format AAAAMMJJTHHMMSSZ sont pris en compte
+                  BACKUPS=$(s3 ls "${BASE}/" | sed -n 's#^ *PRE \([0-9]\{8\}T[0-9]\{6\}Z\)/$#\1#p' | sort)
+                  COUNT=$(printf '%s\n' "${BACKUPS}" | sed '/^$/d' | wc -l)
+                  echo "[INFO] Rotation : ${COUNT} sauvegarde(s), conservation des ${MAX} dernières"
+                  if [ "${COUNT}" -gt "${MAX}" ]; then
+                    printf '%s\n' "${BACKUPS}" | head -n $((COUNT - MAX)) | while read -r OLD; do
+                      echo "[INFO] Suppression de ${OLD}"
+                      s3 rm "${BASE}/${OLD}/" --recursive --only-show-errors
                     done
                   fi
                   {{- end }}
-                  echo "[SUCCESS] Sauvegarde terminée avec succès !"
+
+                  echo "[SUCCESS] Sauvegarde ${TS} terminée"
               env:
-                - name: PGDATABASE
-                  value: {{ .Values.postgres.database | quote }}
-                - name: S3_URL
-                  value: {{ .Values.s3.url | quote }}
-                - name: S3_PREFIX
-                  value: {{ .Values.s3.prefix | quote }}
-                - name: AWS_DEFAULT_REGION
-                  value: {{ .Values.s3.region | quote }}
-                - name: AWS_ACCESS_KEY_ID
-                  valueFrom:
-                    secretKeyRef:
-                      name: {{ default (printf "%s-s3-secret" (include "postgres-backup.fullname" .)) .Values.s3.existingSecret }}
-                      key: {{ .Values.s3.secretKeyRef.accessKeyIdKey }}
-                - name: AWS_SECRET_ACCESS_KEY
-                  valueFrom:
-                    secretKeyRef:
-                      name: {{ default (printf "%s-s3-secret" (include "postgres-backup.fullname" .)) .Values.s3.existingSecret }}
-                      key: {{ .Values.s3.secretKeyRef.secretAccessKeyKey }}
-                {{- if .Values.s3.proxy.httpProxy }}
-                - name: HTTP_PROXY
-                  value: {{ .Values.s3.proxy.httpProxy | quote }}
-                - name: http_proxy
-                  value: {{ .Values.s3.proxy.httpProxy | quote }}
-                {{- end }}
-                {{- if .Values.s3.proxy.httpsProxy }}
-                - name: HTTPS_PROXY
-                  value: {{ .Values.s3.proxy.httpsProxy | quote }}
-                - name: https_proxy
-                  value: {{ .Values.s3.proxy.httpsProxy | quote }}
-                {{- end }}
-                {{- if .Values.s3.proxy.noProxy }}
-                - name: NO_PROXY
-                  value: {{ .Values.s3.proxy.noProxy | quote }}
-                - name: no_proxy
-                  value: {{ .Values.s3.proxy.noProxy | quote }}
-                {{- end }}
-                {{- if .Values.s3.customCa.enabled }}
-                - name: AWS_CA_BUNDLE
-                  value: "/etc/ssl/certs/s3-ca.crt"
-                {{- end }}
+                {{- include "postgres-backup.s3Env" . | nindent 16 }}
+                {{- include "postgres-backup.s3Credentials" (dict "root" . "keys" .Values.s3.secretKeyRef) | nindent 16 }}
               volumeMounts:
-                - name: backup-storage
-                  mountPath: /backup
-                {{- if .Values.s3.customCa.enabled }}
-                - name: custom-ca
-                  mountPath: /etc/ssl/certs/s3-ca.crt
-                  subPath: {{ .Values.s3.customCa.caKey }}
-                  readOnly: true
-                {{- end }}
+                - name: work
+                  mountPath: /work
+                {{- include "postgres-backup.s3VolumeMounts" . | nindent 16 }}
               resources:
                 {{- toYaml .Values.resources | nindent 16 }}

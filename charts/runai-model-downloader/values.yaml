@@ -1,14 +1,14 @@
 # Global values (communes et surchargeables facilement par ArgoCD / Helm)
 global:
-  # Registry d'entreprise (Artifactory, Harbor, Quay)
-  imageRegistry: "artifactory.internal.corp"
+  # Registry d'entreprise (OBLIGATOIRE) : images tirées depuis <imageRegistry>/<repository>:<tag>
+  imageRegistry: ""
   imagePullSecrets: []
-  # - name: artifactory-dockercfg
+  # - name: registry-entreprise-pull-secret
 
 # Image standard Python
 image:
   registry: "" # Vide pour hériter de global.imageRegistry
-  repository: "docker-local/python"
+  repository: "python"
   tag: "3.11-slim"
   pullPolicy: IfNotPresent
   pullSecrets: []

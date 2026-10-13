@@ -1,168 +1,123 @@
 {{- if .Values.restore.enabled }}
+{{- if ne .Values.restore.confirm "RESTORE" }}
+{{- fail "restore.enabled=true : ajouter restore.confirm=RESTORE pour confirmer (les données actuelles seront écrasées)" }}
+{{- end }}
 apiVersion: batch/v1
 kind: Job
 metadata:
-  name: {{ include "postgres-backup.fullname" . }}-restore-{{ now | date "20060102150405" }}
+  name: {{ include "postgres-backup.fullname" . }}-restore
   labels:
     {{- include "postgres-backup.labels" . | nindent 4 }}
-    app.kubernetes.io/component: restore-job
-  annotations:
-    argocd.argoproj.io/hook: PostSync
-    argocd.argoproj.io/hook-delete-policy: BeforeHookCreation
+    app.kubernetes.io/component: restore
 spec:
-  backoffLimit: 1
+  backoffLimit: 0
+  activeDeadlineSeconds: {{ .Values.cronjob.activeDeadlineSeconds }}
   template:
     metadata:
       labels:
         {{- include "postgres-backup.selectorLabels" . | nindent 8 }}
+        app.kubernetes.io/component: restore
     spec:
       restartPolicy: Never
-      {{- $pullSecrets := default .Values.global.imagePullSecrets .Values.backupJob.pullSecrets }}
-      {{- with $pullSecrets }}
-      imagePullSecrets:
-        {{- toYaml . | nindent 8 }}
-      {{- end }}
+      {{- include "postgres-backup.pullSecrets" . | nindent 6 }}
       {{- with .Values.securityContext }}
       securityContext:
         {{- toYaml . | nindent 8 }}
       {{- end }}
       volumes:
-        - name: restore-storage
-          emptyDir: {}
-        {{- if .Values.s3.customCa.enabled }}
-        - name: custom-ca
-          configMap:
-            name: {{ .Values.s3.customCa.configMapName }}
-        {{- end }}
+        - name: work
+          emptyDir:
+            sizeLimit: {{ .Values.workVolume.sizeLimit }}
+        {{- include "postgres-backup.s3Volumes" . | nindent 8 }}
+
       initContainers:
-        # ÉTAPE 1 (S3 EXTERNE -> ON-PREMISE) : aws-cli télécharge depuis le S3 externe
+        # 1) Téléchargement de la sauvegarde depuis le S3 (credentials lecture seule)
         - name: s3-download
           image: {{ include "postgres-backup.s3Image" . | quote }}
           imagePullPolicy: {{ .Values.backupJob.s3Image.pullPolicy }}
-          command:
-            - /bin/sh
-            - -c
+          {{- with .Values.containerSecurityContext }}
+          securityContext:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          command: ["/bin/sh", "-c"]
+          args:
             - |
               set -euo pipefail
-              TARGET_FILE="{{ .Values.restore.dumpFile }}"
-              RAW_URL="${S3_URL}"
-              EXTRA_S3_ARGS=""
+              s3() { aws --endpoint-url "${S3_ENDPOINT}" s3 "$@"; }
+              BASE="s3://${S3_BUCKET}/${S3_PREFIX}"
 
-              if echo "${RAW_URL}" | grep -q '^s3://'; then
-                TARGET_BUCKET=$(echo "${RAW_URL}" | sed 's|^s3://||' | cut -d'/' -f1)
-              elif echo "${RAW_URL}" | grep -q '^https\?://'; then
-                PROTO=$(echo "${RAW_URL}" | grep :// | sed -e's,^\(.*://\).*,\1,g')
-                URL_NO_PROTO=$(echo "${RAW_URL}" | sed -e "s,^$PROTO,,g")
-                HOST_PART=$(echo "${URL_NO_PROTO}" | cut -d'/' -f1)
-                PATH_PART=$(echo "${URL_NO_PROTO}" | cut -d'/' -f2-)
-                
-                if [ -n "${PATH_PART}" ] && [ "${PATH_PART}" != "${HOST_PART}" ]; then
-                  TARGET_BUCKET=$(echo "${PATH_PART}" | cut -d'/' -f1)
-                  ENDPOINT="${PROTO}${HOST_PART}"
-                else
-                  TARGET_BUCKET="${HOST_PART}"
-                  ENDPOINT="${PROTO}${HOST_PART}"
-                fi
-                EXTRA_S3_ARGS="${EXTRA_S3_ARGS} --endpoint-url ${ENDPOINT}"
+              if [ "${RESTORE_BACKUP}" = "latest" ]; then
+                TS=$(s3 cp "${BASE}/LATEST" - | tr -d '[:space:]')
               else
-                TARGET_BUCKET="${RAW_URL}"
+                TS="${RESTORE_BACKUP}"
               fi
+              echo "[INFO] Téléchargement de la sauvegarde ${BASE}/${TS}/"
+              s3 cp "${BASE}/${TS}/" /work/ --recursive --only-show-errors
 
-              if [ -n "${AWS_CA_BUNDLE:-}" ]; then
-                EXTRA_S3_ARGS="${EXTRA_S3_ARGS} --ca-bundle ${AWS_CA_BUNDLE}"
+              if ! ls /work/*.dump > /dev/null 2>&1; then
+                echo "[ERREUR] Aucun dump trouvé dans ${BASE}/${TS}/"
+                exit 1
               fi
-
-              if [ "$TARGET_FILE" = "latest" ]; then
-                S3_SOURCE="s3://${TARGET_BUCKET}/${S3_PREFIX}/latest.dump"
-              else
-                S3_SOURCE="s3://${TARGET_BUCKET}/${S3_PREFIX}/${TARGET_FILE}"
-              fi
-
-              echo "[RESTORE-DOWNLOAD] Téléchargement depuis S3 externe (${S3_SOURCE})..."
-              aws s3 cp "${S3_SOURCE}" /restore/db.dump ${EXTRA_S3_ARGS}
-              echo "[RESTORE-DOWNLOAD] Fichier récupéré avec succès ($(du -h /restore/db.dump | awk '{print $1}'))."
+              ls -lh /work
           env:
-            - name: S3_URL
-              value: {{ .Values.s3.url | quote }}
-            - name: S3_PREFIX
-              value: {{ .Values.s3.prefix | quote }}
-            - name: AWS_DEFAULT_REGION
-              value: {{ .Values.s3.region | quote }}
-            - name: AWS_ACCESS_KEY_ID
-              valueFrom:
-                secretKeyRef:
-                  name: {{ default (printf "%s-s3-secret" (include "postgres-backup.fullname" .)) .Values.s3.existingSecret }}
-                  key: {{ .Values.s3.secretKeyRef.accessKeyIdKey }}
-            - name: AWS_SECRET_ACCESS_KEY
-              valueFrom:
-                secretKeyRef:
-                  name: {{ default (printf "%s-s3-secret" (include "postgres-backup.fullname" .)) .Values.s3.existingSecret }}
-                  key: {{ .Values.s3.secretKeyRef.secretAccessKeyKey }}
-            {{- if .Values.s3.proxy.httpProxy }}
-            - name: HTTP_PROXY
-              value: {{ .Values.s3.proxy.httpProxy | quote }}
-            - name: http_proxy
-              value: {{ .Values.s3.proxy.httpProxy | quote }}
-            {{- end }}
-            {{- if .Values.s3.proxy.httpsProxy }}
-            - name: HTTPS_PROXY
-              value: {{ .Values.s3.proxy.httpsProxy | quote }}
-            - name: https_proxy
-              value: {{ .Values.s3.proxy.httpsProxy | quote }}
-            {{- end }}
-            {{- if .Values.s3.proxy.noProxy }}
-            - name: NO_PROXY
-              value: {{ .Values.s3.proxy.noProxy | quote }}
-            - name: no_proxy
-              value: {{ .Values.s3.proxy.noProxy | quote }}
-            {{- end }}
-            {{- if .Values.s3.customCa.enabled }}
-            - name: AWS_CA_BUNDLE
-              value: "/etc/ssl/certs/s3-ca.crt"
-            {{- end }}
+            {{- include "postgres-backup.s3Env" . | nindent 12 }}
+            {{- include "postgres-backup.s3Credentials" (dict "root" . "keys" .Values.s3.restoreSecretKeyRef) | nindent 12 }}
+            - name: RESTORE_BACKUP
+              value: {{ .Values.restore.backup | quote }}
           volumeMounts:
-            - name: restore-storage
-              mountPath: /restore
-            {{- if .Values.s3.customCa.enabled }}
-            - name: custom-ca
-              mountPath: /etc/ssl/certs/s3-ca.crt
-              subPath: {{ .Values.s3.customCa.caKey }}
-              readOnly: true
-            {{- end }}
+            - name: work
+              mountPath: /work
+            {{- include "postgres-backup.s3VolumeMounts" . | nindent 12 }}
           resources:
             {{- toYaml .Values.resources | nindent 12 }}
 
       containers:
-        # ÉTAPE 2 (ON-PREMISE) : pg_restore applique le dump sur la base locale de prod
+        # 2) pg_restore atomique, refusé si des connexions applicatives sont actives
         - name: pg-restore
           image: {{ include "postgres-backup.postgresImage" . | quote }}
           imagePullPolicy: {{ .Values.backupJob.postgresImage.pullPolicy }}
-          command:
-            - /bin/sh
-            - -c
+          {{- with .Values.containerSecurityContext }}
+          securityContext:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          command: ["/bin/sh", "-c"]
+          args:
             - |
               set -euo pipefail
-              echo "[PG-RESTORE] Démarrage de pg_restore sur ${PGDATABASE} (${PGHOST}:${PGPORT})..."
-              pg_restore -h "${PGHOST}" -p "${PGPORT}" -U "${PGUSER}" -d "${PGDATABASE}" {{ .Values.restore.pgRestoreArgs }} /restore/db.dump
-              rm -f /restore/db.dump
-              echo "[SUCCESS] Base PostgreSQL restaurée avec succès !"
+              if [ -n "${RESTORE_DATABASES}" ]; then
+                DBS="${RESTORE_DATABASES}"
+              else
+                DBS=$(cd /work && ls -1 *.dump | sed 's/\.dump$//')
+              fi
+
+              for DB in ${DBS}; do
+                F="/work/${DB}.dump"
+                [ -f "${F}" ] || { echo "[ERREUR] ${DB}.dump absent de la sauvegarde"; exit 1; }
+
+                EXISTS=$(psql -d postgres -AtX -c "SELECT 1 FROM pg_database WHERE datname = '${DB}'")
+                if [ -z "${EXISTS}" ]; then
+                  echo "[INFO] Base ${DB} inexistante : création"
+                  createdb "${DB}"
+                else
+                  ACTIVE=$(psql -d postgres -AtX -c "SELECT count(*) FROM pg_stat_activity WHERE datname = '${DB}' AND pid <> pg_backend_pid()")
+                  if [ "${ACTIVE}" -ne 0 ]; then
+                    echo "[ERREUR] ${ACTIVE} connexion(s) active(s) sur ${DB} : arrêter le backend Run:ai avant de restaurer"
+                    exit 1
+                  fi
+                fi
+
+                echo "[INFO] pg_restore ${DB}"
+                pg_restore -d "${DB}" {{ .Values.restore.pgRestoreArgs }} "${F}"
+                echo "[OK] ${DB} restaurée"
+              done
+              echo "[SUCCESS] Restauration terminée"
           env:
-            - name: PGHOST
-              value: {{ .Values.postgres.host | quote }}
-            - name: PGPORT
-              value: {{ .Values.postgres.port | quote }}
-            - name: PGDATABASE
-              value: {{ .Values.postgres.database | quote }}
-            - name: PGUSER
-              value: {{ .Values.postgres.username | quote }}
-            - name: PGPASSWORD
-              valueFrom:
-                secretKeyRef:
-                  name: {{ default (printf "%s-pg-secret" (include "postgres-backup.fullname" .)) .Values.postgres.existingSecret }}
-                  key: {{ .Values.postgres.secretKeyRef.passwordKey }}
+            {{- include "postgres-backup.pgEnv" . | nindent 12 }}
+            - name: RESTORE_DATABASES
+              value: {{ join " " .Values.restore.databases | quote }}
           volumeMounts:
-            - name: restore-storage
-              mountPath: /restore
+            - name: work
+              mountPath: /work
           resources:
             {{- toYaml .Values.resources | nindent 12 }}
 {{- end }}

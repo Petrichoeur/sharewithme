@@ -1,0 +1,12 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "postgres-backup.fullname" . }}-aws-config
+  labels:
+    {{- include "postgres-backup.labels" . | nindent 4 }}
+data:
+  config: |
+    [default]
+    region = {{ .Values.s3.region }}
+    s3 =
+      addressing_style = {{ .Values.s3.addressingStyle }}

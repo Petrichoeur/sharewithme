@@ -2,43 +2,47 @@
 
 Ce dépôt contient deux Helm Charts optimisés pour **OpenShift en environnement Air-Gapped strict** et déployables nativement via **ArgoCD (GitOps)** :
 
-1. **`charts/postgres-backup`** : Sauvegarde à chaud PostgreSQL (prod namespace `runai`) avec rotation rolling sur 7 jours et procédure de restauration immédiate vers/depuis un S3 interne.
-2. **`charts/runai-model-downloader`** : Téléchargement autonome d'un modèle d'IA depuis un miroir interne Artifactory HuggingFace dans un PVC dimensionné sur mesure, puis enregistrement en **Data Volume Run:ai** via l'API.
+1. **`charts/postgres-backup`** : Sauvegarde à chaud PostgreSQL (production namespace `runai-backend`) avec rotation rolling sur 7 jours et procédure de restauration immédiate vers/depuis un stockage S3 externe.
+2. **`charts/runai-model-downloader`** : Téléchargement autonome d'un modèle d'IA depuis un miroir interne HuggingFace dans un PVC dimensionné sur mesure, puis enregistrement en **Data Volume Run:ai** via l'API.
 
 ---
 
 ## 🔒 Principes Air-Gapped & Production
 
-- **Zéro build d'image** : Fonctionne avec les images de base standards déjà synchronisées dans votre Artifactory (`postgres:16-alpine`, `amazon/aws-cli:latest`, `python:3.11-slim`).
+- **Zéro build d'image** : Fonctionne directement avec vos images officielles standardisées synchronisées dans votre registry d'entreprise (`postgres:16-alpine`, `amazon/aws-cli:latest`, `python:3.11-slim`).
+- **Registry d'entreprise centralisée (`global.imageRegistry`)** : Totalement variabilisée dans `values.yaml` et surchargée proprement par ArgoCD. Aucun préfixe technique en dur (comme `docker-local`).
 - **Zéro installation au runtime** : Aucun appel à `pip`, `apk` ou `apt` pendant l'exécution des pods.
-- **Zéro buffer disque local** : Les flux de backup/restore transitent via des pipes FIFO en mémoire RAM (`emptyDir: medium: Memory`) pour éviter tout risque de disque plein ou crash OOM.
 - **Conformité OpenShift SCC** : Exécution sous profils de sécurité restreints (`runAsNonRoot: true`, `drop: [ALL]`, `allowPrivilegeEscalation: false`).
 
 ---
 
-## 1. `charts/postgres-backup`
+## 1. `charts/postgres-backup` (Namespace `runai-backend`)
 
 ### Architecture & Fonctionnement
 
 ```
-[CronJob quotidien]
+[CronJob quotidien] - Namespace runai-backend
 ┌───────────────────────────────── Pod Backup ─────────────────────────────────┐
 │                                                                              │
 │   InitContainer (postgres:16-alpine)         Conteneur (aws-cli:latest)      │
 │   ┌───────────────────────────────┐          ┌───────────────────────────┐   │
-│   │ 1. pg_dump -Fc (à chaud)      │ ──File──>│ 2. aws s3 cp ...          │───┼──> S3 Interne
-│   │    vers /backup/db.dump       │ (volume) │    + Purge Rolling > 7    │   │
+│   │ 1. pg_dump -Fc (à chaud)      │ ──File──>│ 2. aws s3 cp ...          │───┼──> S3 Externe
+│   │    vers /work/<timestamp>/    │ (volume) │    + Vérification intègre │   │
+│   │    + vérification pg_restore  │          │    + Purge Rolling > 7    │   │
 │   └───────────────────────────────┘          └───────────────────────────┘   │
 └──────────────────────────────────────────────────────────────────────────────┘
 ```
 
-- **Backup à chaud** : Utilise le format custom PostgreSQL (`-Fc`) avec transaction snapshot (aucun verrou bloquant sur l'application).
-- **Rolling Snapshots (7 jours)** : Après chaque sauvegarde réussie, le script liste les snapshots S3 horodatés et supprime automatiquement les plus anciens pour **conserver strictement les 7 derniers**.
-- **Pointeur `latest.dump`** : Maintenu à jour à chaque sauvegarde pour simplifier une restauration d'urgence.
+- **Production-Ready & Multi-bases** : Sauvegarde des rôles (`globals.sql`) et de toutes les bases applicatives Run:ai avec vérification d'intégrité de l'archive (`pg_restore --list`) avant upload.
+- **Secrets existants câblés** :
+  - Secret base PostgreSQL : `runai-backend-postgresql` (clé `postgres-password`).
+  - Secret S3 : `accesskey-s3-backup` (clés `userfa` / `pwdfa` pour le backup, `userro` / `pwdro` pour la restauration).
+- **Rolling Snapshots (7 jours)** : Après chaque sauvegarde réussie, purge automatique pour **conserver strictement les 7 derniers snapshots**.
+- **Pointeur `LATEST`** : Maintenu à jour pour pointer directement sur la dernière sauvegarde valide.
 
 ### Déploiement ArgoCD
 
-Créez une ressource ArgoCD `Application` :
+Exemple d'Application ArgoCD :
 
 ```yaml
 apiVersion: argoproj.io/v1alpha1
@@ -55,35 +59,37 @@ spec:
     helm:
       values: |
         global:
-          imageRegistry: artifactory.internal.corp
+          # Votre registry d'entreprise interne
+          imageRegistry: registry.entreprise.corp
+          imagePullSecrets:
+            - name: my-registry-secret
         backupJob:
           postgresImage:
-            repository: docker-local/postgres
+            repository: postgres
             tag: "16-alpine"
           s3Image:
-            repository: docker-local/aws-cli
+            repository: amazon/aws-cli
             tag: "latest"
         postgres:
-          host: postgres-postgresql.runai.svc.cluster.local
-          database: runai
-          existingSecret: runai-pg-credentials
+          host: runai-backend-postgresql.runai-backend.svc.cluster.local
+          existingSecret: runai-backend-postgresql
           secretKeyRef:
             passwordKey: postgres-password
         s3:
-          # URL complète fournie par les équipes (ex: https://s3.eu-west-3.amazonaws.com/mon-bucket ou https://mon-s3.corp/mon-bucket)
-          url: "https://s3.eu-west-3.amazonaws.com/runai-pg-backups"
-          # Nom du Secret K8s existant fourni par les équipes
-          existingSecret: "s3-credentials"
-          prefix: "postgres-prod"
-          # Proxy d'entreprise si nécessaire pour sortir du on-premise :
-          # proxy:
-          #   httpsProxy: "http://proxy.internal.corp:3128"
+          url: "https://s3.eu-west-3.amazonaws.com/mon-bucket-backup"
+          existingSecret: accesskey-s3-backup
+          secretKeyRef:
+            accessKeyIdKey: userfa
+            secretAccessKeyKey: pwdfa
+          restoreSecretKeyRef:
+            accessKeyIdKey: userro
+            secretAccessKeyKey: pwdro
           rollingRotation:
             enabled: true
             maxSnapshots: 7
   destination:
     server: https://kubernetes.default.svc
-    namespace: runai
+    namespace: runai-backend
   syncPolicy:
     automated:
       prune: true
@@ -92,16 +98,15 @@ spec:
 
 ### Procédure de Restauration (Disaster Recovery)
 
-En cas d'incident sur la base de données, déclenchez le job de restauration :
+En cas d'incident, déclenchez le job de restauration après avoir arrêté les connexions de l'application Run:ai :
 
 ```bash
-# Restaurer le dernier snapshot disponible :
-helm upgrade --install postgres-backup ./charts/postgres-backup -n runai \
+helm upgrade --install postgres-backup ./charts/postgres-backup -n runai-backend \
   --reuse-values \
   --set restore.enabled=true \
-  --set restore.dumpFile="latest"
+  --set restore.confirm=RESTORE \
+  --set restore.backup="latest"
 ```
-*(Pour cibler un snapshot précis : `--set restore.dumpFile="runai_20261009_020000Z.dump"`)*.
 
 ---
 
@@ -115,7 +120,7 @@ helm upgrade --install postgres-backup ./charts/postgres-backup -n runai \
                       ▼
                [Job PostSync Hook] (python:3.11-slim)
                       │
-                      ├─ 1. Télécharge les poids en streaming direct depuis le miroir Artifactory vers /mnt/models
+                      ├─ 1. Télécharge les poids en streaming direct depuis le miroir interne vers /mnt/models
                       │
                       └─ 2. Appelle l'API Run:ai (/api/v1/token puis /api/v1/datavolumes)
                             => PVC transformé en Data Volume Run:ai partagé
@@ -131,9 +136,8 @@ Exécutez le script utilitaire fourni :
 ```bash
 python3 charts/runai-model-downloader/calculate-size.py \
   mistralai/Mistral-7B-v0.1 \
-  --endpoint "https://artifactory.internal.corp/artifactory/api/huggingface"
+  --endpoint "https://miroir-hf.entreprise.corp/api/huggingface"
 ```
-*Exemple : Modèle de 14.48 GiB ➔ Taille recommandée avec buffer : `16Gi`.*
 
 ### Étape 2 : Déploiement ArgoCD
 
@@ -152,26 +156,26 @@ spec:
     helm:
       values: |
         global:
-          imageRegistry: artifactory.internal.corp
+          imageRegistry: registry.entreprise.corp
         image:
-          repository: docker-local/python
+          repository: python
           tag: "3.11-slim"
         model:
           repoId: "mistralai/Mistral-7B-v0.1"
-          endpointUrl: "https://artifactory.internal.corp/artifactory/api/huggingface"
+          endpointUrl: "https://miroir-hf.entreprise.corp/api/huggingface"
         storage:
           size: "16Gi"
           storageClassName: "ocs-storagecluster-ceph-rbd"
         runai:
           enabled: true
-          controlPlaneUrl: "https://runai.internal.corp"
+          controlPlaneUrl: "https://runai.entreprise.corp"
           clusterUuid: "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx"
           dataVolumeName: "mistral-7b-v0-1"
           projectName: "ai-research"
           authSecretName: "runai-api-credentials"
   destination:
     server: https://kubernetes.default.svc
-    namespace: runai
+    namespace: runai-backend
 ```
 
 ---
@@ -187,9 +191,9 @@ spec:
     │   ├── values.yaml
     │   └── templates/
     │       ├── _helpers.tpl
-    │       ├── cronjob.yaml          # Backup quotidien 2 images + FIFO + Rolling 7
-    │       ├── job-restore.yaml      # Restore d'urgence à la demande
-    │       └── secret.yaml
+    │       ├── configmap-aws.yaml    # Config S3 addressing style
+    │       ├── cronjob.yaml          # Backup quotidien 2 images + volume partagé + Rolling 7
+    │       └── job-restore.yaml      # Restore sécurisé à la demande
     └── runai-model-downloader/
         ├── Chart.yaml
         ├── values.yaml

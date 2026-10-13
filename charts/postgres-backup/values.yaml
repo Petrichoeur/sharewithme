@@ -1,92 +1,130 @@
-# Global values (communes et surchargeables facilement par ArgoCD / Helm)
+# ==============================================================================
+# postgres-backup : pg_dump à chaud de la base Run:ai (runai-backend) -> S3 externe
+# Déployer ce chart dans le namespace "runai-backend" (là où tourne PostgreSQL).
+# ==============================================================================
+
 global:
-  imageRegistry: "artifactory.internal.corp"
+  # Registry d'entreprise (OBLIGATOIRE). Les images sont tirées depuis :
+  #   <imageRegistry>/<repository>:<tag>   ex: registry.entreprise.fr/postgres:16-alpine
+  imageRegistry: ""
   imagePullSecrets: []
-  # - name: artifactory-dockercfg
+  # - name: registry-entreprise-pull-secret
 
 backupJob:
+  # Surcharge optionnelle des pullSecrets (sinon global.imagePullSecrets)
+  pullSecrets: []
+
+  # Image PostgreSQL officielle : fournit pg_dump / pg_dumpall / pg_restore / psql
+  # Le client doit être >= à la version du serveur (serveur Run:ai = 16.3)
   postgresImage:
-    registry: "" # Vide pour hériter de global.imageRegistry
-    repository: "docker-local/postgres"
+    registry: "" # vide = global.imageRegistry
+    repository: "postgres"
     tag: "16-alpine"
     pullPolicy: IfNotPresent
 
+  # Image AWS CLI officielle : envoi / lecture S3
   s3Image:
-    registry: "" # Vide pour hériter de global.imageRegistry
-    repository: "docker-local/aws-cli"
+    registry: "" # vide = global.imageRegistry
+    repository: "amazon/aws-cli"
     tag: "latest"
     pullPolicy: IfNotPresent
 
 cronjob:
-  schedule: "0 2 * * *"
+  schedule: "0 2 * * *" # tous les jours à 02:00
+  timeZone: "Europe/Paris"
   concurrencyPolicy: Forbid
+  startingDeadlineSeconds: 3600
+  activeDeadlineSeconds: 7200 # tue le job s'il dépasse 2h
+  backoffLimit: 2
   successfulJobsHistoryLimit: 3
   failedJobsHistoryLimit: 5
 
+# Volume de travail temporaire (emptyDir) où sont écrits les dumps avant envoi S3
+workVolume:
+  sizeLimit: "20Gi"
+
+# ------------------------------------------------------------------------------
+# PostgreSQL Run:ai (chart Bitnami postgresql, release "runai-backend")
+# ------------------------------------------------------------------------------
 postgres:
-  host: "postgres-postgresql.runai.svc.cluster.local"
+  host: "runai-backend-postgresql.runai-backend.svc.cluster.local"
   port: 5432
-  database: "runai"
+  # Superuser : nécessaire pour pg_dumpall --globals-only (rôles) et pour restaurer
   username: "postgres"
-  existingSecret: ""
+  existingSecret: "runai-backend-postgresql"
   secretKeyRef:
     passwordKey: "postgres-password"
-  password: ""
-  pgDumpArgs: "-Fc --verbose --no-owner --no-privileges"
+  # Bases à sauvegarder. Vide = toutes les bases (hors templates), détectées automatiquement.
+  databases: []
+  # Format custom compressé. Owners et privilèges conservés (indispensable pour l'app Run:ai).
+  pgDumpArgs: "-Fc"
 
-# ==============================================================================
-# S3 EXTERNE : Vous n'avez qu'à renseigner l'URL et le SECRET fourni par les équipes !
-# ==============================================================================
+# ------------------------------------------------------------------------------
+# S3 externe : URL + secret fournis par les équipes
+# ------------------------------------------------------------------------------
 s3:
-  # URL complète fournie par les équipes (ex: https://s3-externe.company.com/mon-bucket ou https://s3.eu-west-3.amazonaws.com/mon-bucket)
-  # Si l'URL contient déjà le bucket (ex: https://endpoint/mon-bucket), le chart extrait automatiquement l'endpoint et le bucket.
-  url: "https://s3.eu-west-3.amazonaws.com/runai-pg-backups"
-
-  # Nom du Secret K8s existant fourni par les équipes
-  existingSecret: "s3-credentials"
-
-  # Clés dans le Secret existant (avec fallbacks automatiques pour s'adapter au format des équipes)
-  secretKeyRef:
-    accessKeyIdKey: "AWS_ACCESS_KEY_ID"         # ou "access-key", "AWS_ACCESS_KEY", "access_key_id"
-    secretAccessKeyKey: "AWS_SECRET_ACCESS_KEY" # ou "secret-key", "AWS_SECRET_KEY", "secret_access_key"
-
-  # Préfixe / dossier dans le bucket
-  prefix: "postgres-runai-prod"
-
-  # Région par défaut (us-east-1 standard compatible tout S3, ou région spécifique)
+  # URL fournie, format path-style : https://<endpoint>/<bucket>
+  url: ""
+  # Optionnel : à renseigner seulement si l'URL ne contient pas le bucket
+  bucket: ""
+  # Dossier dans le bucket
+  prefix: "runai-backend-postgres"
   region: "us-east-1"
+  # "path" pour la majorité des S3 compatibles (Ceph, MinIO, Scality, NetApp...), "virtual" pour AWS
+  addressingStyle: "path"
 
-  # Proxy d'entreprise sortant si votre OpenShift on-premise doit traverser un proxy pour sortir vers ce S3 externe
+  # Secret fourni par les équipes. ATTENTION : il doit exister dans le namespace de déploiement.
+  existingSecret: "accesskey-s3-backup"
+  # Accès complet (écriture + suppression pour la rotation) -> utilisé par le backup
+  secretKeyRef:
+    accessKeyIdKey: "userfa"
+    secretAccessKeyKey: "pwdfa"
+  # Accès lecture seule -> utilisé par la restauration
+  restoreSecretKeyRef:
+    accessKeyIdKey: "userro"
+    secretAccessKeyKey: "pwdro"
+
+  # Proxy sortant si le cluster on-premise doit passer par un proxy pour joindre le S3
   proxy:
     httpProxy: ""
     httpsProxy: ""
     noProxy: "localhost,127.0.0.1,.svc,.cluster.local"
 
-  # Certificat CA d'entreprise si proxy avec interception TLS
+  # CA d'entreprise (proxy avec inspection TLS ou S3 avec PKI privée)
   customCa:
     enabled: false
     configMapName: "corp-root-ca"
     caKey: "ca.crt"
 
-  # Rotation Rolling : conserve strictement les N derniers snapshots
+  # Rotation : ne garde que les N dernières sauvegardes
   rollingRotation:
     enabled: true
     maxSnapshots: 7
 
-# Restauration à chaud
+# ------------------------------------------------------------------------------
+# Restauration (voir README : arrêter le backend Run:ai avant !)
+# ------------------------------------------------------------------------------
 restore:
   enabled: false
-  dumpFile: "latest" # ou nom précis ex: runai_20261009_020000Z.dump
-  pgRestoreArgs: "-Fc --clean --if-exists --no-owner --no-privileges --verbose"
+  # Garde-fou : doit valoir exactement "RESTORE" pour que le Job soit généré
+  confirm: ""
+  # "latest" ou un horodatage de sauvegarde, ex: 20261013T020000Z
+  backup: "latest"
+  # Bases à restaurer. Vide = toutes les bases présentes dans la sauvegarde.
+  databases: []
+  # Restauration atomique : tout ou rien
+  pgRestoreArgs: "--clean --if-exists --single-transaction"
 
 securityContext:
   runAsNonRoot: true
+  seccompProfile:
+    type: RuntimeDefault
+
+containerSecurityContext:
   allowPrivilegeEscalation: false
   capabilities:
     drop:
       - ALL
-  seccompProfile:
-    type: RuntimeDefault
 
 resources:
   limits:
