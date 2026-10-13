@@ -1,48 +1,20 @@
 # sharewithme
 
-Ce dépôt contient deux Helm Charts optimisés pour **OpenShift en environnement Air-Gapped strict** et déployables nativement via **ArgoCD (GitOps)** :
-
-1. **`charts/postgres-backup`** : Sauvegarde à chaud PostgreSQL (production namespace `runai-backend`) avec rotation rolling sur 7 jours et procédure de restauration immédiate vers/depuis un stockage S3 externe.
-2. **`charts/runai-model-downloader`** : Téléchargement autonome d'un modèle d'IA depuis un miroir interne HuggingFace dans un PVC dimensionné sur mesure, puis enregistrement en **Data Volume Run:ai** via l'API.
-
----
-
-## 🔒 Principes Air-Gapped & Production
-
-- **Zéro build d'image** : Fonctionne directement avec vos images officielles standardisées synchronisées dans votre registry d'entreprise (`postgres:16-alpine`, `amazon/aws-cli:latest`, `python:3.11-slim`).
-- **Registry d'entreprise centralisée (`global.imageRegistry`)** : Totalement variabilisée dans `values.yaml` et surchargée proprement par ArgoCD. Aucun préfixe technique en dur (comme `docker-local`).
-- **Zéro installation au runtime** : Aucun appel à `pip`, `apk` ou `apt` pendant l'exécution des pods.
-- **Conformité OpenShift SCC** : Exécution sous profils de sécurité restreints (`runAsNonRoot: true`, `drop: [ALL]`, `allowPrivilegeEscalation: false`).
+Helm Charts pour OpenShift en environnement Air-Gapped déployables via ArgoCD :
+1. `charts/postgres-backup` : Sauvegarde à chaud (pg_dump) de PostgreSQL (`runai-backend`) vers S3 externe avec rotation sur 7 jours et restauration.
+2. `charts/runai-model-downloader` : Téléchargement d'un modèle depuis un miroir interne vers un PV adapté et création du Data Volume Run:ai.
 
 ---
 
 ## 1. `charts/postgres-backup` (Namespace `runai-backend`)
 
-### Architecture & Fonctionnement
-
-```
-[CronJob quotidien] - Namespace runai-backend
-┌───────────────────────────────── Pod Backup ─────────────────────────────────┐
-│                                                                              │
-│   InitContainer (postgres:16-alpine)         Conteneur (aws-cli:latest)      │
-│   ┌───────────────────────────────┐          ┌───────────────────────────┐   │
-│   │ 1. pg_dump -Fc (à chaud)      │ ──File──>│ 2. aws s3 cp ...          │───┼──> S3 Externe
-│   │    vers /work/<timestamp>/    │ (volume) │    + Vérification intègre │   │
-│   │    + vérification pg_restore  │          │    + Purge Rolling > 7    │   │
-│   └───────────────────────────────┘          └───────────────────────────┘   │
-└──────────────────────────────────────────────────────────────────────────────┘
-```
-
-- **Production-Ready & Multi-bases** : Sauvegarde des rôles (`globals.sql`) et de toutes les bases applicatives Run:ai avec vérification d'intégrité de l'archive (`pg_restore --list`) avant upload.
-- **Secrets existants câblés** :
-  - Secret base PostgreSQL : `runai-backend-postgresql` (clé `postgres-password`).
-  - Secret S3 : `accesskey-s3-backup` (clés `userfa` / `pwdfa` pour le backup, `userro` / `pwdro` pour la restauration).
-- **Rolling Snapshots (7 jours)** : Après chaque sauvegarde réussie, purge automatique pour **conserver strictement les 7 derniers snapshots**.
-- **Pointeur `LATEST`** : Maintenu à jour pour pointer directement sur la dernière sauvegarde valide.
+### Fonctionnement
+- **Sauvegarde séquentielle** :
+  1. `InitContainer` (`postgres:16-alpine`) : `pg_dumpall --globals-only` (rôles) + `pg_dump -Fc` de chaque base vers `/work/<timestamp>/` et vérification de l'intégrité de l'archive (`pg_restore --list`).
+  2. `Conteneur principal` (`amazon/aws-cli:latest`) : Envoi vers S3 externe, mise à jour du pointeur `LATEST`, purge pour conserver strictement les **7 derniers snapshots**, nettoyage local.
+- **Restauration** : Job à la demande qui télécharge depuis S3 et exécute `pg_restore`.
 
 ### Déploiement ArgoCD
-
-Exemple d'Application ArgoCD :
 
 ```yaml
 apiVersion: argoproj.io/v1alpha1
@@ -59,24 +31,14 @@ spec:
     helm:
       values: |
         global:
-          # Votre registry d'entreprise interne
           imageRegistry: registry.entreprise.corp
-          imagePullSecrets:
-            - name: my-registry-secret
-        backupJob:
-          postgresImage:
-            repository: postgres
-            tag: "16-alpine"
-          s3Image:
-            repository: amazon/aws-cli
-            tag: "latest"
         postgres:
           host: runai-backend-postgresql.runai-backend.svc.cluster.local
           existingSecret: runai-backend-postgresql
           secretKeyRef:
             passwordKey: postgres-password
         s3:
-          url: "https://s3.eu-west-3.amazonaws.com/mon-bucket-backup"
+          url: "https://mon-s3-externe.corp/mon-bucket"
           existingSecret: accesskey-s3-backup
           secretKeyRef:
             accessKeyIdKey: userfa
@@ -96,9 +58,7 @@ spec:
       selfHeal: true
 ```
 
-### Procédure de Restauration (Disaster Recovery)
-
-En cas d'incident, déclenchez le job de restauration après avoir arrêté les connexions de l'application Run:ai :
+### Restauration d'urgence
 
 ```bash
 helm upgrade --install postgres-backup ./charts/postgres-backup -n runai-backend \
@@ -112,34 +72,15 @@ helm upgrade --install postgres-backup ./charts/postgres-backup -n runai-backend
 
 ## 2. `charts/runai-model-downloader`
 
-### Architecture & Fonctionnement
+### Calcul préalable de la taille du PV
 
-```
-[ArgoCD Sync] ──> Crée le PVC (taille fit)
-                      │
-                      ▼
-               [Job PostSync Hook] (python:3.11-slim)
-                      │
-                      ├─ 1. Télécharge les poids en streaming direct depuis le miroir interne vers /mnt/models
-                      │
-                      └─ 2. Appelle l'API Run:ai (/api/v1/token puis /api/v1/datavolumes)
-                            => PVC transformé en Data Volume Run:ai partagé
-```
-
-- **Dimensionnement exact du PV** : Le volume est calculé pour s'adapter exactement aux poids du modèle (+15% de marge pour les métadonnées et la journalisation ext4/xfs).
-- **Zéro pip install** : Le script de téléchargement et le client API Run:ai utilisent uniquement la bibliothèque standard Python (`urllib.request`, `json`, `ssl`).
-- **Conformité API Run:ai** : Respecte les spécifications de l'API Workload Assets / Data Volumes de Run:ai (authentification OAuth2 Client Credentials).
-
-### Étape 1 : Pré-calcul de la taille optimale du PV
-
-Exécutez le script utilitaire fourni :
 ```bash
 python3 charts/runai-model-downloader/calculate-size.py \
   mistralai/Mistral-7B-v0.1 \
   --endpoint "https://miroir-hf.entreprise.corp/api/huggingface"
 ```
 
-### Étape 2 : Déploiement ArgoCD
+### Déploiement ArgoCD
 
 ```yaml
 apiVersion: argoproj.io/v1alpha1
@@ -157,9 +98,6 @@ spec:
       values: |
         global:
           imageRegistry: registry.entreprise.corp
-        image:
-          repository: python
-          tag: "3.11-slim"
         model:
           repoId: "mistralai/Mistral-7B-v0.1"
           endpointUrl: "https://miroir-hf.entreprise.corp/api/huggingface"
@@ -176,31 +114,4 @@ spec:
   destination:
     server: https://kubernetes.default.svc
     namespace: runai-backend
-```
-
----
-
-## 📁 Structure du Répertoire
-
-```text
-.
-├── README.md
-└── charts/
-    ├── postgres-backup/
-    │   ├── Chart.yaml
-    │   ├── values.yaml
-    │   └── templates/
-    │       ├── _helpers.tpl
-    │       ├── configmap-aws.yaml    # Config S3 addressing style
-    │       ├── cronjob.yaml          # Backup quotidien 2 images + volume partagé + Rolling 7
-    │       └── job-restore.yaml      # Restore sécurisé à la demande
-    └── runai-model-downloader/
-        ├── Chart.yaml
-        ├── values.yaml
-        ├── calculate-size.py         # Utilitaire de calcul de taille du PV
-        └── templates/
-            ├── _helpers.tpl
-            ├── pvc.yaml              # PVC dimensionné sur mesure
-            ├── job.yaml              # Job ArgoCD PostSync Hook
-            └── configmap-scripts.yaml # Scripts Python purs sans pip (download + API Run:ai)
 ```

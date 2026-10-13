@@ -1,13 +1,8 @@
-# Global values (communes et surchargeables facilement par ArgoCD / Helm)
 global:
-  # Registry d'entreprise (OBLIGATOIRE) : images tirées depuis <imageRegistry>/<repository>:<tag>
   imageRegistry: ""
   imagePullSecrets: []
-  # - name: registry-entreprise-pull-secret
 
-# Image standard Python
 image:
-  registry: "" # Vide pour hériter de global.imageRegistry
   repository: "python"
   tag: "3.11-slim"
   pullPolicy: IfNotPresent
@@ -16,25 +11,21 @@ image:
 model:
   repoId: "mistralai/Mistral-7B-v0.1"
   revision: "main"
-  # URL du repo miroir interne HuggingFace (Artifactory)
   endpointUrl: "https://artifactory.internal.corp/artifactory/api/huggingface"
   tokenSecretName: ""
   tokenSecretKey: "HF_TOKEN"
 
 storage:
-  # Taille du PV dimensionnée au plus juste (calculée via calculate-size.py)
   size: "16Gi"
-  # StorageClass OpenShift (ex: ocs-storagecluster-ceph-rbd, standard, gp3-csi)
   storageClassName: "ocs-storagecluster-ceph-rbd"
   accessModes:
     - ReadWriteOnce
   mountPath: "/mnt/models"
 
-# Intégration Run:ai Data Volume (selon doc officielle NVIDIA docs.run.ai)
 runai:
   enabled: true
   controlPlaneUrl: "https://runai.internal.corp"
-  clusterUuid: "" # Cluster ID Run:ai cible
+  clusterUuid: ""
   authSecretName: "runai-api-credentials"
   clientIdKey: "CLIENT_ID"
   clientSecretKey: "CLIENT_SECRET"
