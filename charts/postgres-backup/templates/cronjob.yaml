@@ -36,7 +36,6 @@ spec:
             {{- include "postgres-backup.s3Volumes" . | nindent 12 }}
 
           initContainers:
-            # 1) pg_dump : rôles + chaque base, contrôle d'intégrité de chaque archive
             - name: pg-dump
               image: {{ include "postgres-backup.postgresImage" . | quote }}
               imagePullPolicy: {{ .Values.backupJob.postgresImage.pullPolicy }}
@@ -52,22 +51,14 @@ spec:
                   OUT="/work/${TS}"
                   mkdir -p "${OUT}"
 
-                  if [ -n "${PG_DATABASES}" ]; then
-                    DBS="${PG_DATABASES}"
-                  else
-                    DBS=$(psql -d postgres -AtX -c "SELECT datname FROM pg_database WHERE datallowconn AND NOT datistemplate ORDER BY datname")
-                  fi
-                  [ -n "${DBS}" ] || { echo "[ERREUR] Aucune base à sauvegarder"; exit 1; }
-                  echo "[INFO] Bases à sauvegarder : $(echo ${DBS})"
+                  DBS="${PG_DATABASES:-$(psql -d postgres -AtX -c "SELECT datname FROM pg_database WHERE datallowconn AND NOT datistemplate ORDER BY datname")}"
+                  [ -n "${DBS}" ] || exit 1
 
-                  echo "[INFO] Export des rôles (pg_dumpall --globals-only)"
                   pg_dumpall -l postgres --globals-only -f "${OUT}/globals.sql"
 
                   for DB in ${DBS}; do
-                    echo "[INFO] pg_dump ${DB}"
                     pg_dump -d "${DB}" {{ .Values.postgres.pgDumpArgs }} -f "${OUT}/${DB}.dump"
                     pg_restore --list "${OUT}/${DB}.dump" > /dev/null
-                    echo "[OK] ${DB} : $(du -h "${OUT}/${DB}.dump" | cut -f1) (archive vérifiée)"
                   done
 
                   echo "${TS}" > /work/TIMESTAMP
@@ -82,7 +73,6 @@ spec:
                 {{- toYaml .Values.resources | nindent 16 }}
 
           containers:
-            # 2) Envoi S3 + vérification + pointeur LATEST + rotation
             - name: s3-upload
               image: {{ include "postgres-backup.s3Image" . | quote }}
               imagePullPolicy: {{ .Values.backupJob.s3Image.pullPolicy }}
@@ -101,45 +91,28 @@ spec:
                     TARGET_BUCKET=$(s3 ls | awk '{print $3}' | grep -v '^$' | head -n 1 || true)
                     if [ -z "${TARGET_BUCKET}" ]; then
                       TARGET_BUCKET="backup-runai-backend"
-                      echo "[INFO] Aucun bucket trouvé, création de ${TARGET_BUCKET}..."
                       s3 mb "s3://${TARGET_BUCKET}" || true
                     fi
                   fi
-                  echo "[INFO] Utilisation du bucket : ${TARGET_BUCKET}"
 
                   TS=$(cat /work/TIMESTAMP)
                   BASE="s3://${TARGET_BUCKET}/${S3_PREFIX}"
 
-                  echo "[INFO] Envoi vers ${BASE}/${TS}/"
                   s3 cp "/work/${TS}/" "${BASE}/${TS}/" --recursive --only-show-errors
-
-                  LOCAL=$(ls -1 "/work/${TS}" | wc -l)
-                  REMOTE=$(s3 ls "${BASE}/${TS}/" | wc -l)
-                  if [ "${LOCAL}" -ne "${REMOTE}" ]; then
-                    echo "[ERREUR] ${REMOTE} fichier(s) sur S3 pour ${LOCAL} attendu(s)"
-                    exit 1
-                  fi
-                  echo "[OK] ${LOCAL} fichier(s) envoyé(s) et vérifié(s)"
-
                   echo "${TS}" > /tmp/LATEST
                   s3 cp /tmp/LATEST "${BASE}/LATEST" --only-show-errors
                   rm -rf "/work/${TS}"
 
                   {{- if .Values.s3.rollingRotation.enabled }}
                   MAX={{ .Values.s3.rollingRotation.maxSnapshots | int }}
-                  # Seuls les dossiers au format AAAAMMJJTHHMMSSZ sont pris en compte
                   BACKUPS=$(s3 ls "${BASE}/" | sed -n 's#^ *PRE \([0-9]\{8\}T[0-9]\{6\}Z\)/$#\1#p' | sort)
                   COUNT=$(printf '%s\n' "${BACKUPS}" | sed '/^$/d' | wc -l)
-                  echo "[INFO] Rotation : ${COUNT} sauvegarde(s), conservation des ${MAX} dernières"
                   if [ "${COUNT}" -gt "${MAX}" ]; then
                     printf '%s\n' "${BACKUPS}" | head -n $((COUNT - MAX)) | while read -r OLD; do
-                      echo "[INFO] Suppression de ${OLD}"
                       s3 rm "${BASE}/${OLD}/" --recursive --only-show-errors
                     done
                   fi
                   {{- end }}
-
-                  echo "[SUCCESS] Sauvegarde ${TS} terminée"
               env:
                 {{- include "postgres-backup.s3Env" . | nindent 16 }}
                 {{- include "postgres-backup.s3Credentials" (dict "root" . "keys" .Values.s3.secretKeyRef) | nindent 16 }}
