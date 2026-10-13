@@ -38,7 +38,7 @@ spec:
           secretKeyRef:
             passwordKey: postgres-password
         s3:
-          url: "https://mon-s3-externe.corp/mon-bucket"
+          url: "https://s3.ecs01.group.gca"
           existingSecret: accesskey-s3-backup
           secretKeyRef:
             accessKeyIdKey: userfa

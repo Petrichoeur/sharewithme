@@ -96,8 +96,19 @@ spec:
                   set -euo pipefail
                   s3() { aws --endpoint-url "${S3_ENDPOINT}" s3 "$@"; }
 
+                  TARGET_BUCKET="${S3_BUCKET}"
+                  if [ -z "${TARGET_BUCKET}" ]; then
+                    TARGET_BUCKET=$(s3 ls | awk '{print $3}' | grep -v '^$' | head -n 1 || true)
+                    if [ -z "${TARGET_BUCKET}" ]; then
+                      TARGET_BUCKET="backup-runai-backend"
+                      echo "[INFO] Aucun bucket trouvé, création de ${TARGET_BUCKET}..."
+                      s3 mb "s3://${TARGET_BUCKET}" || true
+                    fi
+                  fi
+                  echo "[INFO] Utilisation du bucket : ${TARGET_BUCKET}"
+
                   TS=$(cat /work/TIMESTAMP)
-                  BASE="s3://${S3_BUCKET}/${S3_PREFIX}"
+                  BASE="s3://${TARGET_BUCKET}/${S3_PREFIX}"
 
                   echo "[INFO] Envoi vers ${BASE}/${TS}/"
                   s3 cp "/work/${TS}/" "${BASE}/${TS}/" --recursive --only-show-errors

@@ -44,7 +44,15 @@ spec:
             - |
               set -euo pipefail
               s3() { aws --endpoint-url "${S3_ENDPOINT}" s3 "$@"; }
-              BASE="s3://${S3_BUCKET}/${S3_PREFIX}"
+
+              TARGET_BUCKET="${S3_BUCKET}"
+              if [ -z "${TARGET_BUCKET}" ]; then
+                TARGET_BUCKET=$(s3 ls | awk '{print $3}' | grep -v '^$' | head -n 1 || true)
+                [ -n "${TARGET_BUCKET}" ] || { echo "[ERREUR] Aucun bucket S3 trouvé"; exit 1; }
+              fi
+              echo "[INFO] Utilisation du bucket : ${TARGET_BUCKET}"
+
+              BASE="s3://${TARGET_BUCKET}/${S3_PREFIX}"
 
               if [ "${RESTORE_BACKUP}" = "latest" ]; then
                 TS=$(s3 cp "${BASE}/LATEST" - | tr -d '[:space:]')

@@ -31,7 +31,7 @@ postgres:
   pgDumpArgs: "-Fc"
 
 s3:
-  url: ""
+  url: "https://s3.ecs01.group.gca"
   bucket: ""
   prefix: "runai-backend-postgres"
   region: "us-east-1"
