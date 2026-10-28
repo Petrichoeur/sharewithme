@@ -22,6 +22,17 @@ Create a default fully qualified app name.
 {{- end }}
 
 {{/*
+Nom du PVC (existant ou créé par le chart)
+*/}}
+{{- define "runai-model-downloader.pvcName" -}}
+{{- if .Values.storage.existingClaim }}
+{{- .Values.storage.existingClaim }}
+{{- else }}
+{{- printf "%s-pvc" (include "runai-model-downloader.fullname" .) }}
+{{- end }}
+{{- end }}
+
+{{/*
 Common labels
 */}}
 {{- define "runai-model-downloader.labels" -}}
@@ -45,7 +56,7 @@ Docker image reference with registry support (fallback on global.imageRegistry)
 {{- define "runai-model-downloader.image" -}}
 {{- $registry := default (default "" .Values.global.imageRegistry) .Values.image.registry }}
 {{- if $registry }}
-{{- printf "%s/%s:%s" $registry .Values.image.repository .Values.image.tag }}
+{{- printf "%s/%s:%s" (trimSuffix "/" $registry) .Values.image.repository .Values.image.tag }}
 {{- else }}
 {{- printf "%s:%s" .Values.image.repository .Values.image.tag }}
 {{- end }}

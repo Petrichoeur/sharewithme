@@ -1,0 +1,76 @@
+global:
+  imageRegistry: ""
+  imagePullSecrets: []
+
+restoreJob:
+  postgresImage:
+    repository: "postgres"
+    tag: "16-alpine"
+    pullPolicy: IfNotPresent
+  s3Image:
+    repository: "amazon/aws-cli"
+    tag: "2.15.30"
+    pullPolicy: IfNotPresent
+  pullSecrets: []
+  activeDeadlineSeconds: 7200
+
+# Sécurité anti-écrasement accidentel : confirm DOIT être égal à "CONFIRM-RESTORE"
+restore:
+  confirm: ""
+  # "latest" ou timestamp précis (ex: "20261027T220000Z")
+  backup: "latest"
+  # Liste des bases spécifiques à restaurer. Vide = restaure tous les dumps trouvés dans le snapshot.
+  databases: []
+  # Arguments transmis à pg_restore
+  pgRestoreArgs: "--clean --if-exists --single-transaction"
+  # Si true, termine les connexions applicatives actives avant restauration
+  terminateActiveConnections: true
+
+workVolume:
+  sizeLimit: "20Gi"
+
+postgres:
+  host: "runai-backend-postgresql.runai-backend.svc.cluster.local"
+  port: 5432
+  username: "postgres"
+  existingSecret: "runai-backend-postgresql"
+  secretKeyRef:
+    passwordKey: "postgres-password"
+
+s3:
+  url: "https://s3.ecs01.group.gca"
+  bucket: ""
+  prefix: "runai-backend-postgres"
+  region: "us-east-1"
+  addressingStyle: "path"
+  existingSecret: "accesskey-s3-backup"
+  secretKeyRef:
+    accessKeyIdKey: "userro"
+    secretAccessKeyKey: "pwdro"
+  proxy:
+    httpProxy: ""
+    httpsProxy: ""
+    noProxy: "localhost,127.0.0.1,.svc,.cluster.local"
+  customCa:
+    enabled: false
+    configMapName: "corp-root-ca"
+    caKey: "ca.crt"
+
+securityContext:
+  runAsNonRoot: true
+  seccompProfile:
+    type: RuntimeDefault
+
+containerSecurityContext:
+  allowPrivilegeEscalation: false
+  capabilities:
+    drop:
+      - ALL
+
+resources:
+  limits:
+    cpu: "2"
+    memory: "2Gi"
+  requests:
+    cpu: "250m"
+    memory: "512Mi"

@@ -51,17 +51,31 @@ spec:
                   OUT="/work/${TS}"
                   mkdir -p "${OUT}"
 
-                  DBS="${PG_DATABASES:-$(psql -d postgres -AtX -c "SELECT datname FROM pg_database WHERE datallowconn AND NOT datistemplate ORDER BY datname")}"
-                  [ -n "${DBS}" ] || exit 1
+                  echo "[$(date -u +%T)] Découverte des bases PostgreSQL sur ${PGHOST}:${PGPORT}..."
+                  if [ -n "${PG_DATABASES:-}" ]; then
+                    DBS="${PG_DATABASES}"
+                  else
+                    DBS=$(psql -d postgres -AtX -c "SELECT datname FROM pg_database WHERE datallowconn AND NOT datistemplate ORDER BY datname")
+                  fi
 
+                  if [ -z "${DBS}" ]; then
+                    echo "[ERROR] Aucune base de données identifiée pour la sauvegarde !" >&2
+                    exit 1
+                  fi
+
+                  echo "[$(date -u +%T)] Bases cibles : ${DBS}"
+                  echo "[$(date -u +%T)] Sauvegarde des objets globaux (rôles, tablespaces)..."
                   pg_dumpall -l postgres --globals-only -f "${OUT}/globals.sql"
 
                   for DB in ${DBS}; do
+                    echo "[$(date -u +%T)] Dump de la base '${DB}' vers ${OUT}/${DB}.dump..."
                     pg_dump -d "${DB}" {{ .Values.postgres.pgDumpArgs }} -f "${OUT}/${DB}.dump"
+                    echo "[$(date -u +%T)] Vérification de l'intégrité de l'archive '${DB}'..."
                     pg_restore --list "${OUT}/${DB}.dump" > /dev/null
                   done
 
                   echo "${TS}" > /work/TIMESTAMP
+                  echo "[$(date -u +%T)] Dump terminé avec succès pour le snapshot ${TS}."
               env:
                 {{- include "postgres-backup.pgEnv" . | nindent 16 }}
                 - name: PG_DATABASES
@@ -88,31 +102,45 @@ spec:
 
                   TARGET_BUCKET="${S3_BUCKET}"
                   if [ -z "${TARGET_BUCKET}" ]; then
-                    TARGET_BUCKET=$(s3 ls | awk '{print $3}' | grep -v '^$' | head -n 1 || true)
+                    echo "[$(date -u +%T)] Recherche du bucket S3..."
+                    TARGET_BUCKET=$(s3 ls 2>/dev/null | awk '{print $3}' | grep -v '^$' | head -n 1 || true)
                     if [ -z "${TARGET_BUCKET}" ]; then
                       TARGET_BUCKET="backup-runai-backend"
+                      echo "[$(date -u +%T)] Aucun bucket détecté, tentative de création : s3://${TARGET_BUCKET}"
                       s3 mb "s3://${TARGET_BUCKET}" || true
                     fi
                   fi
 
+                  [ -f /work/TIMESTAMP ] || { echo "[ERROR] /work/TIMESTAMP manquant" >&2; exit 1; }
                   TS=$(cat /work/TIMESTAMP)
                   BASE="s3://${TARGET_BUCKET}/${S3_PREFIX}"
 
+                  echo "[$(date -u +%T)] Transfert du snapshot ${TS} vers ${BASE}/${TS}/..."
                   s3 cp "/work/${TS}/" "${BASE}/${TS}/" --recursive --only-show-errors
+
+                  echo "[$(date -u +%T)] Mise à jour du pointeur LATEST..."
                   echo "${TS}" > /tmp/LATEST
                   s3 cp /tmp/LATEST "${BASE}/LATEST" --only-show-errors
-                  rm -rf "/work/${TS}"
+
+                  echo "[$(date -u +%T)] Nettoyage du volume local de travail..."
+                  rm -rf "/work/${TS}" /work/TIMESTAMP
 
                   {{- if .Values.s3.rollingRotation.enabled }}
                   MAX={{ .Values.s3.rollingRotation.maxSnapshots | int }}
-                  BACKUPS=$(s3 ls "${BASE}/" | sed -n 's#^ *PRE \([0-9]\{8\}T[0-9]\{6\}Z\)/$#\1#p' | sort)
+                  echo "[$(date -u +%T)] Vérification de la rétention (limite : ${MAX} snapshots)..."
+                  BACKUPS=$(s3 ls "${BASE}/" | sed -n 's#^ *PRE \([0-9]\{8\}T[0-9]\{6\}Z\)/$#\1#p' | sort || true)
                   COUNT=$(printf '%s\n' "${BACKUPS}" | sed '/^$/d' | wc -l)
                   if [ "${COUNT}" -gt "${MAX}" ]; then
-                    printf '%s\n' "${BACKUPS}" | head -n $((COUNT - MAX)) | while read -r OLD; do
+                    EXCESS=$((COUNT - MAX))
+                    echo "[$(date -u +%T)] Suppression de ${EXCESS} snapshot(s) obsolète(s)..."
+                    printf '%s\n' "${BACKUPS}" | head -n "${EXCESS}" | while read -r OLD; do
+                      [ -n "${OLD}" ] || continue
+                      echo "[$(date -u +%T)] Suppression de ${BASE}/${OLD}/"
                       s3 rm "${BASE}/${OLD}/" --recursive --only-show-errors
                     done
                   fi
                   {{- end }}
+                  echo "[$(date -u +%T)] Sauvegarde et rotation achevées avec succès."
               env:
                 {{- include "postgres-backup.s3Env" . | nindent 16 }}
                 {{- include "postgres-backup.s3Credentials" (dict "root" . "keys" .Values.s3.secretKeyRef) | nindent 16 }}

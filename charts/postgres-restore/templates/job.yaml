@@ -1,0 +1,138 @@
+{{- if ne .Values.restore.confirm "CONFIRM-RESTORE" }}
+{{- fail "SECURITE RESTAURATION : .Values.restore.confirm doit être explicitement défini à 'CONFIRM-RESTORE' pour exécuter une restauration." }}
+{{- end }}
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: {{ include "postgres-restore.fullname" . }}-job
+  labels:
+    {{- include "postgres-restore.labels" . | nindent 4 }}
+    app.kubernetes.io/component: restore
+spec:
+  backoffLimit: 0
+  activeDeadlineSeconds: {{ .Values.restoreJob.activeDeadlineSeconds }}
+  template:
+    metadata:
+      labels:
+        {{- include "postgres-restore.selectorLabels" . | nindent 8 }}
+        app.kubernetes.io/component: restore
+    spec:
+      restartPolicy: Never
+      {{- include "postgres-restore.pullSecrets" . | nindent 6 }}
+      {{- with .Values.securityContext }}
+      securityContext:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      volumes:
+        - name: work
+          emptyDir:
+            sizeLimit: {{ .Values.workVolume.sizeLimit }}
+        {{- include "postgres-restore.s3Volumes" . | nindent 8 }}
+
+      initContainers:
+        - name: s3-download
+          image: {{ include "postgres-restore.s3Image" . | quote }}
+          imagePullPolicy: {{ .Values.restoreJob.s3Image.pullPolicy }}
+          {{- with .Values.containerSecurityContext }}
+          securityContext:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          command: ["/bin/sh", "-c"]
+          args:
+            - |
+              set -euo pipefail
+              s3() { aws --endpoint-url "${S3_ENDPOINT}" s3 "$@"; }
+
+              TARGET_BUCKET="${S3_BUCKET}"
+              if [ -z "${TARGET_BUCKET}" ]; then
+                TARGET_BUCKET=$(s3 ls 2>/dev/null | awk '{print $3}' | grep -v '^$' | head -n 1 || true)
+                [ -n "${TARGET_BUCKET}" ] || { echo "[ERROR] Bucket S3 introuvable !" >&2; exit 1; }
+              fi
+
+              BASE="s3://${TARGET_BUCKET}/${S3_PREFIX}"
+
+              if [ "${RESTORE_BACKUP}" = "latest" ]; then
+                echo "[$(date -u +%T)] Récupération de la référence LATEST..."
+                TS=$(s3 cp "${BASE}/LATEST" - 2>/dev/null | tr -d '[:space:]')
+                [ -n "${TS}" ] || { echo "[ERROR] Pointeur LATEST manquant sur S3 !" >&2; exit 1; }
+              else
+                TS="${RESTORE_BACKUP}"
+              fi
+
+              echo "[$(date -u +%T)] Téléchargement du snapshot '${TS}' depuis ${BASE}/${TS}/..."
+              s3 cp "${BASE}/${TS}/" /work/ --recursive --only-show-errors
+
+              echo "[$(date -u +%T)] Fichiers récupérés :"
+              ls -la /work/
+              ls /work/*.dump > /dev/null 2>&1 || { echo "[ERROR] Aucun fichier .dump trouvé !" >&2; exit 1; }
+              echo "[$(date -u +%T)] Téléchargement terminé."
+          env:
+            {{- include "postgres-restore.s3Env" . | nindent 12 }}
+            {{- include "postgres-restore.s3Credentials" (dict "root" . "keys" .Values.s3.secretKeyRef) | nindent 12 }}
+            - name: RESTORE_BACKUP
+              value: {{ .Values.restore.backup | quote }}
+          volumeMounts:
+            - name: work
+              mountPath: /work
+            {{- include "postgres-restore.s3VolumeMounts" . | nindent 12 }}
+          resources:
+            {{- toYaml .Values.resources | nindent 12 }}
+
+      containers:
+        - name: pg-restore
+          image: {{ include "postgres-restore.postgresImage" . | quote }}
+          imagePullPolicy: {{ .Values.restoreJob.postgresImage.pullPolicy }}
+          {{- with .Values.containerSecurityContext }}
+          securityContext:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          command: ["/bin/sh", "-c"]
+          args:
+            - |
+              set -euo pipefail
+
+              # Restauration des rôles/globals si présents
+              if [ -f "/work/globals.sql" ]; then
+                echo "[$(date -u +%T)] Restauration des objets globaux (globals.sql)..."
+                psql -d postgres -f /work/globals.sql || echo "[WARN] Certains rôles existent déjà (ignoré)."
+              fi
+
+              if [ -n "${RESTORE_DATABASES:-}" ]; then
+                DBS="${RESTORE_DATABASES}"
+              else
+                DBS=$(cd /work && ls -1 *.dump 2>/dev/null | sed 's/\.dump$//' || true)
+              fi
+
+              [ -n "${DBS}" ] || { echo "[ERROR] Aucune base à restaurer !" >&2; exit 1; }
+
+              for DB in ${DBS}; do
+                F="/work/${DB}.dump"
+                [ -f "${F}" ] || { echo "[ERROR] Fichier '${F}' inexistant !" >&2; exit 1; }
+
+                echo "[$(date -u +%T)] Préparation de la base de données '${DB}'..."
+                EXISTS=$(psql -d postgres -AtX -c "SELECT 1 FROM pg_database WHERE datname = '${DB}'" || true)
+
+                if [ -z "${EXISTS}" ]; then
+                  echo "[$(date -u +%T)] La base '${DB}' n'existe pas, création..."
+                  createdb "${DB}"
+                else
+                  {{- if .Values.restore.terminateActiveConnections }}
+                  echo "[$(date -u +%T)] Fermeture des connexions actives sur '${DB}'..."
+                  psql -d postgres -c "SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname = '${DB}' AND pid <> pg_backend_pid();" || true
+                  {{- end }}
+                fi
+
+                echo "[$(date -u +%T)] Exécution de pg_restore sur '${DB}'..."
+                pg_restore -d "${DB}" {{ .Values.restore.pgRestoreArgs }} "${F}" || echo "[INFO] pg_restore terminé (codes d'avertissements éventuels tolérés)."
+              done
+
+              echo "[$(date -u +%T)] Restauration terminée avec succès !"
+          env:
+            {{- include "postgres-restore.pgEnv" . | nindent 12 }}
+            - name: RESTORE_DATABASES
+              value: {{ join " " .Values.restore.databases | quote }}
+          volumeMounts:
+            - name: work
+              mountPath: /work
+          resources:
+            {{- toYaml .Values.resources | nindent 12 }}

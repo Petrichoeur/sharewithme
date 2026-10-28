@@ -5,7 +5,6 @@ metadata:
   labels:
     {{- include "runai-model-downloader.labels" . | nindent 4 }}
   annotations:
-    # ArgoCD PostSync Hook pour exécuter le téléchargement et la création du volume automatiquement après sync du PVC
     argocd.argoproj.io/hook: PostSync
     argocd.argoproj.io/hook-delete-policy: BeforeHookCreation
 spec:
@@ -30,9 +29,11 @@ spec:
           configMap:
             name: {{ include "runai-model-downloader.fullname" . }}-scripts
             defaultMode: 0755
+        {{- if .Values.model.repoId }}
         - name: model-storage
           persistentVolumeClaim:
-            claimName: {{ include "runai-model-downloader.fullname" . }}-pvc
+            claimName: {{ include "runai-model-downloader.pvcName" . }}
+        {{- end }}
         {{- if .Values.customCa.enabled }}
         - name: custom-ca
           configMap:
@@ -42,17 +43,25 @@ spec:
         - name: model-downloader
           image: {{ include "runai-model-downloader.image" . | quote }}
           imagePullPolicy: {{ .Values.image.pullPolicy }}
+          {{- with .Values.containerSecurityContext }}
+          securityContext:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
           command:
             - /bin/sh
             - -c
             - |
               set -euo pipefail
 
+              {{- if .Values.model.repoId }}
               echo "=== 1. Téléchargement du modèle HuggingFace depuis le miroir ==="
               python3 /scripts/download_model.py
+              {{- else }}
+              echo "=== 1. Aucun model.repoId fourni : étape de téléchargement ignorée ==="
+              {{- end }}
 
               {{- if .Values.runai.enabled }}
-              echo "=== 2. Transformation en Data Volume Run:ai (API) ==="
+              echo "=== 2. Enregistrement du PVC en Data Volume Run:ai (v2.23) ==="
               python3 /scripts/register_runai_volume.py
               {{- end }}
 
@@ -67,7 +76,7 @@ spec:
             - name: TARGET_DIR
               value: {{ .Values.storage.mountPath | quote }}
             - name: PVC_NAME
-              value: {{ printf "%s-pvc" (include "runai-model-downloader.fullname" .) | quote }}
+              value: {{ include "runai-model-downloader.pvcName" . | quote }}
             {{- if .Values.model.tokenSecretName }}
             - name: HF_TOKEN
               valueFrom:
@@ -86,6 +95,12 @@ spec:
               value: {{ .Values.runai.dataVolumeDescription | quote }}
             - name: RUNAI_PROJECT_NAME
               value: {{ .Values.runai.projectName | quote }}
+            - name: RUNAI_PROJECT_ID
+              value: {{ .Values.runai.projectId | quote }}
+            - name: RUNAI_SHARE_CLUSTER
+              value: {{ .Values.runai.shareWithCluster | quote }}
+            - name: RUNAI_SHARED_SCOPES
+              value: {{ .Values.runai.sharedScopes | toJson | quote }}
             {{- if .Values.runai.authSecretName }}
             - name: RUNAI_CLIENT_ID
               valueFrom:
@@ -110,8 +125,10 @@ spec:
           volumeMounts:
             - name: scripts
               mountPath: /scripts
+            {{- if .Values.model.repoId }}
             - name: model-storage
               mountPath: {{ .Values.storage.mountPath }}
+            {{- end }}
             {{- if .Values.customCa.enabled }}
             - name: custom-ca
               mountPath: /etc/ssl/certs/corp-ca.crt

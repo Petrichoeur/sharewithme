@@ -1,6 +1,6 @@
 apiVersion: v2
 name: postgres-backup
-description: Sauvegarde à chaud (pg_dump) de la base PostgreSQL Run:ai (runai-backend) vers un S3 externe, avec rotation et restauration.
+description: Sauvegarde à chaud (pg_dump) de la base PostgreSQL Run:ai vers un S3 externe avec rotation glissante.
 type: application
-version: 2.0.0
+version: 2.1.0
 appVersion: "16"

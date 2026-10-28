@@ -9,6 +9,7 @@ image:
   pullSecrets: []
 
 model:
+  # Laisser vide si le modèle est déjà présent sur un PVC existant et que l'on souhaite uniquement l'enregistrer dans Run:ai
   repoId: "mistralai/Mistral-7B-v0.1"
   revision: "main"
   endpointUrl: "https://artifactory.internal.corp/artifactory/api/huggingface"
@@ -16,6 +17,8 @@ model:
   tokenSecretKey: "HF_TOKEN"
 
 storage:
+  # Nom d'un PVC existant (si renseigné, aucun nouveau PVC n'est créé)
+  existingClaim: ""
   size: "16Gi"
   storageClassName: "ocs-storagecluster-ceph-rbd"
   accessModes:
@@ -29,9 +32,16 @@ runai:
   authSecretName: "runai-api-credentials"
   clientIdKey: "CLIENT_ID"
   clientSecretKey: "CLIENT_SECRET"
+  # Nom du Data Volume dans Run:ai (doit respecter ^[a-z][-a-z0-9]{0,62}$)
   dataVolumeName: "mistral-7b-v0-1"
-  dataVolumeDescription: "Modèle mistralai/Mistral-7B-v0.1 provisionné depuis Artifactory"
+  dataVolumeDescription: "Modèle mistralai/Mistral-7B-v0.1"
+  # Projet Run:ai dans lequel se trouve le PVC (nom ou ID numérique)
   projectName: "ai-research"
+  projectId: ""
+  # Si true, partage automatiquement ce Data Volume à tout le cluster (via PATCH /sharedScopes)
+  shareWithCluster: false
+  # Liste optionnelle de scopes supplémentaires : [{"scopeType": "department", "scopeId": "1"}, {"scopeType": "project", "scopeId": "2"}]
+  sharedScopes: []
 
 customCa:
   enabled: false
@@ -40,12 +50,14 @@ customCa:
 
 securityContext:
   runAsNonRoot: true
+  seccompProfile:
+    type: RuntimeDefault
+
+containerSecurityContext:
   allowPrivilegeEscalation: false
   capabilities:
     drop:
       - ALL
-  seccompProfile:
-    type: RuntimeDefault
 
 resources:
   limits:

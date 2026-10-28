@@ -9,14 +9,18 @@ backupJob:
     pullPolicy: IfNotPresent
   s3Image:
     repository: "amazon/aws-cli"
-    tag: "latest"
+    tag: "2.15.30"
     pullPolicy: IfNotPresent
+  pullSecrets: []
 
 cronjob:
   schedule: "0 2 * * *"
   concurrencyPolicy: Forbid
+  startingDeadlineSeconds: 300
   successfulJobsHistoryLimit: 3
   failedJobsHistoryLimit: 5
+  backoffLimit: 1
+  activeDeadlineSeconds: 7200
 
 workVolume:
   sizeLimit: "20Gi"
@@ -25,6 +29,8 @@ postgres:
   host: "runai-backend-postgresql.runai-backend.svc.cluster.local"
   port: 5432
   username: "postgres"
+  # Liste des bases à sauvegarder. Vide = détection automatique de toutes les bases non-template.
+  databases: []
   existingSecret: "runai-backend-postgresql"
   secretKeyRef:
     passwordKey: "postgres-password"
@@ -40,9 +46,6 @@ s3:
   secretKeyRef:
     accessKeyIdKey: "userfa"
     secretAccessKeyKey: "pwdfa"
-  restoreSecretKeyRef:
-    accessKeyIdKey: "userro"
-    secretAccessKeyKey: "pwdro"
   proxy:
     httpProxy: ""
     httpsProxy: ""
@@ -55,12 +58,6 @@ s3:
     enabled: true
     maxSnapshots: 7
 
-restore:
-  enabled: false
-  confirm: ""
-  backup: "latest"
-  pgRestoreArgs: "--clean --if-exists --single-transaction"
-
 securityContext:
   runAsNonRoot: true
   seccompProfile:
@@ -68,6 +65,7 @@ securityContext:
 
 containerSecurityContext:
   allowPrivilegeEscalation: false
+  readOnlyRootFilesystem: false
   capabilities:
     drop:
       - ALL

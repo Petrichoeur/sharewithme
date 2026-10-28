@@ -1,0 +1,6 @@
+apiVersion: v2
+name: postgres-restore
+description: Job de restauration d'urgence à la demande pour PostgreSQL Run:ai depuis S3.
+type: application
+version: 1.0.0
+appVersion: "16"
