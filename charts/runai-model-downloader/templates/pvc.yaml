@@ -1,16 +1,12 @@
-{{- if not .Values.storage.existingClaim }}
+{{- if .Values.storage.createPvc }}
 apiVersion: v1
 kind: PersistentVolumeClaim
 metadata:
-  name: {{ include "runai-model-downloader.pvcName" . }}
-  labels:
-    {{- include "runai-model-downloader.labels" . | nindent 4 }}
+  name: {{ .Values.storage.pvcName }}
 spec:
   accessModes:
-    {{- toYaml .Values.storage.accessModes | nindent 4 }}
-  {{- if .Values.storage.storageClassName }}
+    - {{ .Values.storage.accessMode }}
   storageClassName: {{ .Values.storage.storageClassName | quote }}
-  {{- end }}
   resources:
     requests:
       storage: {{ .Values.storage.size | quote }}

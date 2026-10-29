@@ -1,259 +1,106 @@
 apiVersion: v1
 kind: ConfigMap
 metadata:
-  name: {{ include "runai-model-downloader.fullname" . }}-scripts
-  labels:
-    {{- include "runai-model-downloader.labels" . | nindent 4 }}
+  name: {{ .Release.Name }}-scripts
 data:
-  download_model.py: |
+  run.py: |
     import os
     import sys
     import json
-    import ssl
-    import time
-    import urllib.request
-
-    repo_id = os.environ.get("MODEL_REPO_ID", "").strip()
-    if not repo_id:
-        print("[INFO] Aucun MODEL_REPO_ID spécifié. Téléchargement ignoré.")
-        sys.exit(0)
-
-    endpoint = os.environ.get("HF_ENDPOINT", "https://huggingface.co").rstrip("/")
-    revision = os.environ.get("MODEL_REVISION", "main")
-    token = os.environ.get("HF_TOKEN")
-    local_dir = os.environ.get("TARGET_DIR", "/mnt/models")
-
-    ctx = ssl.create_default_context()
-    ca_bundle = os.environ.get("REQUESTS_CA_BUNDLE") or os.environ.get("SSL_CERT_FILE")
-    if ca_bundle and os.path.exists(ca_bundle):
-        ctx.load_verify_locations(cafile=ca_bundle)
-
-    headers = {"User-Agent": "runai-model-downloader/2.0"}
-    if token:
-        headers["Authorization"] = f"Bearer {token}"
-
-    api_url = f"{endpoint}/api/models/{repo_id}/revision/{revision}"
-    print(f"[{time.strftime('%X')}] [DOWNLOAD] Consultation de l'API miroir : {api_url}")
-
-    req = urllib.request.Request(api_url, headers=headers)
-    try:
-        with urllib.request.urlopen(req, context=ctx) as resp:
-            data = json.loads(resp.read().decode())
-    except Exception as e:
-        print(f"[ERROR] Impossible de joindre l'API du miroir ({api_url}): {e}")
-        sys.exit(1)
-
-    siblings = data.get("siblings", [])
-    if not siblings:
-        print("[ERROR] Aucun fichier listé dans le dépôt modèle.")
-        sys.exit(1)
-
-    total_files = len(siblings)
-    print(f"[{time.strftime('%X')}] [DOWNLOAD] {total_files} fichiers répertoriés à destination de {local_dir}")
-
-    for idx, item in enumerate(siblings, start=1):
-        rel_path = item.get("rfilename")
-        if not rel_path:
-            continue
-        dest_path = os.path.join(local_dir, rel_path)
-        os.makedirs(os.path.dirname(dest_path), exist_ok=True)
-
-        download_url = f"{endpoint}/{repo_id}/resolve/{revision}/{rel_path}"
-
-        expected_size = item.get("size")
-        if expected_size and os.path.exists(dest_path) and os.path.getsize(dest_path) == expected_size:
-            print(f"[{idx}/{total_files}] [SKIP] {rel_path} déjà présent ({expected_size} octets).")
-            continue
-
-        print(f"[{idx}/{total_files}] [GET] {rel_path}...")
-        file_req = urllib.request.Request(download_url, headers=headers)
-        with urllib.request.urlopen(file_req, context=ctx) as file_resp, open(dest_path, "wb") as out_file:
-            while True:
-                chunk = file_resp.read(16 * 1024 * 1024)
-                if not chunk:
-                    break
-                out_file.write(chunk)
-
-    print(f"[{time.strftime('%X')}] [SUCCESS] Téléchargement intégral terminé avec succès !")
-
-  register_runai_volume.py: |
-    import os
-    import sys
-    import json
-    import ssl
-    import time
-    import re
     import urllib.request
     import urllib.parse
 
-    def sanitize_name(name: str) -> str:
-        clean = re.sub(r'[^a-zA-Z0-9-]', '-', name.lower()).strip('-')
-        if not clean:
-            clean = "datavolume"
-        if not clean[0].isalpha():
-            clean = f"dv-{clean}"
-        return clean[:63].rstrip('-')
+    def http_json(url, method="GET", data=None, headers=None):
+        req_headers = headers or {}
+        body = json.dumps(data).encode("utf-8") if data is not None else None
+        req = urllib.request.Request(url, data=body, headers=req_headers, method=method)
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            return json.loads(resp.read().decode("utf-8"))
 
-    runai_url = os.environ.get("RUNAI_BASE_URL", "").rstrip("/")
-    client_id = os.environ.get("RUNAI_CLIENT_ID")
-    client_secret = os.environ.get("RUNAI_CLIENT_SECRET")
-    cluster_uuid = os.environ.get("RUNAI_CLUSTER_UUID", "").strip()
-    raw_volume_name = os.environ.get("RUNAI_VOLUME_NAME", "")
-    volume_desc = os.environ.get("RUNAI_VOLUME_DESC", "")[:127]
-    pvc_name = os.environ.get("PVC_NAME", "").strip()
-    project_name = os.environ.get("RUNAI_PROJECT_NAME", "").strip()
-    project_id = os.environ.get("RUNAI_PROJECT_ID", "").strip()
-    share_cluster = os.environ.get("RUNAI_SHARE_CLUSTER", "false").lower() == "true"
-    shared_scopes_raw = os.environ.get("RUNAI_SHARED_SCOPES", "[]")
+    def download_model():
+        repo_id = os.environ.get("MODEL_REPO_ID", "").strip()
+        if not repo_id:
+            return
 
-    if not runai_url or not client_id or not client_secret:
-        print("[INFO] Identifiants Run:ai non fournis, enregistrement Data Volume ignoré.")
-        sys.exit(0)
+        endpoint = os.environ["HF_ENDPOINT"].rstrip("/")
+        revision = os.environ.get("MODEL_REVISION", "main")
+        target_dir = os.environ["TARGET_DIR"]
+        token = os.environ.get("HF_TOKEN")
 
-    volume_name = sanitize_name(raw_volume_name or pvc_name)
+        headers = {"User-Agent": "runai-model-downloader/1.0"}
+        if token:
+            headers["Authorization"] = f"Bearer {token}"
 
-    ctx = ssl.create_default_context()
-    ca_bundle = os.environ.get("REQUESTS_CA_BUNDLE") or os.environ.get("SSL_CERT_FILE")
-    if ca_bundle and os.path.exists(ca_bundle):
-        ctx.load_verify_locations(cafile=ca_bundle)
+        info_url = f"{endpoint}/api/models/{repo_id}/revision/{revision}"
+        print(f"[1/2] Récupération de la liste des fichiers depuis {info_url}...")
+        info = http_json(info_url, headers=headers)
+        files = info.get("siblings", [])
 
-    # 1. Authentification OAuth2 Run:ai (supporte /api/v1/token JSON et /api/v2/token form-urlencoded)
-    print(f"[{time.strftime('%X')}] [RUNAI] Authentification sur {runai_url}...")
-    token = None
+        for i, item in enumerate(files, 1):
+            fname = item["rfilename"]
+            dest = os.path.join(target_dir, fname)
+            os.makedirs(os.path.dirname(dest), exist_ok=True)
 
-    # Essai 1 : /api/v1/token en JSON (standard Run:ai 2.x)
-    try:
-        req = urllib.request.Request(
-            f"{runai_url}/api/v1/token",
-            data=json.dumps({
-                "grantType": "client_credentials",
-                "clientId": client_id,
-                "clientSecret": client_secret
-            }).encode("utf-8"),
-            headers={"Content-Type": "application/json", "Accept": "application/json"},
-            method="POST"
-        )
-        with urllib.request.urlopen(req, context=ctx, timeout=15) as resp:
-            data = json.loads(resp.read().decode())
-            token = data.get("accessToken") or data.get("access_token")
-    except Exception:
-        pass
-
-    # Essai 2 : /api/v2/token en x-www-form-urlencoded (OAuth2 standard)
-    if not token:
-        try:
-            req = urllib.request.Request(
-                f"{runai_url}/api/v2/token",
-                data=urllib.parse.urlencode({
-                    "grant_type": "client_credentials",
-                    "client_id": client_id,
-                    "client_secret": client_secret
-                }).encode("utf-8"),
-                headers={"Content-Type": "application/x-www-form-urlencoded", "Accept": "application/json"},
-                method="POST"
-            )
-            with urllib.request.urlopen(req, context=ctx, timeout=15) as resp:
-                data = json.loads(resp.read().decode())
-                token = data.get("access_token") or data.get("accessToken")
-        except Exception:
-            pass
-
-    if not token:
-        print("[ERROR] Impossible d'obtenir un token d'accès Run:ai.")
-        sys.exit(1)
-
-    auth_headers = {
-        "Authorization": f"Bearer {token}",
-        "Content-Type": "application/json",
-        "Accept": "application/json"
-    }
-
-    # 2. Résolution obligatoire du projectId à partir du projectName
-    if not project_id and project_name:
-        print(f"[{time.strftime('%X')}] [RUNAI] Résolution de l'ID du projet '{project_name}'...")
-        q = urllib.parse.urlencode({"filterBy": f"name=={project_name}"})
-        endpoints = [
-            f"{runai_url}/api/v1/org-unit/projects?{q}",
-            f"{runai_url}/api/v1/projects?{q}"
-        ]
-        if cluster_uuid:
-            endpoints.append(f"{runai_url}/v1/k8s/clusters/{cluster_uuid}/projects")
-
-        for ep in endpoints:
-            try:
-                req = urllib.request.Request(ep, headers=auth_headers)
-                with urllib.request.urlopen(req, context=ctx, timeout=15) as resp:
-                    pdata = json.loads(resp.read().decode())
-                    plist = pdata.get("projects", pdata if isinstance(pdata, list) else [])
-                    for p in plist:
-                        if p.get("name") == project_name:
-                            project_id = str(p.get("id"))
-                            if not cluster_uuid and p.get("clusterId"):
-                                cluster_uuid = str(p.get("clusterId"))
-                            break
-                if project_id:
-                    break
-            except Exception:
+            if item.get("size") and os.path.exists(dest) and os.path.getsize(dest) == item["size"]:
+                print(f"  [{i}/{len(files)}] {fname} (déjà présent)")
                 continue
 
-    if not project_id:
-        print(f"[ERROR] Impossible de résoudre l'ID du projet '{project_name}'. Vérifiez runai.projectName ou renseignez runai.projectId.")
-        sys.exit(1)
+            print(f"  [{i}/{len(files)}] Téléchargement de {fname}...")
+            url = f"{endpoint}/{repo_id}/resolve/{revision}/{fname}"
+            req = urllib.request.Request(url, headers=headers)
+            with urllib.request.urlopen(req) as resp, open(dest, "wb") as out:
+                while chunk := resp.read(16 * 1024 * 1024):
+                    out.write(chunk)
 
-    # 3. Enregistrement du PVC existant en Data Volume (useOriginalVolume=True : aucune recréation/copie du PVC dans le projet d'origine)
-    dv_payload = {
-        "name": volume_name,
-        "description": volume_desc or f"Data Volume pour {pvc_name}",
-        "originPvcName": pvc_name,
-        "projectId": str(project_id),
-        "useOriginalVolume": True
-    }
+    def register_datavolume():
+        if os.environ.get("RUNAI_ENABLED", "true").lower() != "true":
+            return
 
-    print(f"[{time.strftime('%X')}] [RUNAI] Enregistrement du PVC '{pvc_name}' en Data Volume '{volume_name}' (projectId={project_id}, useOriginalVolume=True)...")
-    dv_id = None
-    try:
-        req_dv = urllib.request.Request(
-            f"{runai_url}/api/v1/datavolumes",
-            data=json.dumps(dv_payload).encode("utf-8"),
-            headers=auth_headers,
-            method="POST"
+        base_url = os.environ["RUNAI_URL"].rstrip("/")
+        client_id = os.environ["RUNAI_CLIENT_ID"]
+        client_secret = os.environ["RUNAI_CLIENT_SECRET"]
+        project_name = os.environ["RUNAI_PROJECT_NAME"]
+        pvc_name = os.environ["PVC_NAME"]
+        dv_name = os.environ["RUNAI_DV_NAME"]
+        dv_desc = os.environ.get("RUNAI_DV_DESC", "")
+
+        print(f"[2/2] Authentification sur {base_url}...")
+        token_resp = http_json(
+            f"{base_url}/api/v1/token",
+            method="POST",
+            data={"grantType": "client_credentials", "clientId": client_id, "clientSecret": client_secret},
+            headers={"Content-Type": "application/json"}
         )
-        with urllib.request.urlopen(req_dv, context=ctx, timeout=15) as resp:
-            resp_obj = json.loads(resp.read().decode())
-            dv_id = resp_obj.get("id")
-            print(f"[{time.strftime('%X')}] [SUCCESS] Data Volume '{volume_name}' enregistré (ID: {dv_id}) !")
-    except urllib.error.HTTPError as he:
-        err_msg = he.read().decode()
-        if he.code == 409 or "already exists" in err_msg.lower():
-            print(f"[{time.strftime('%X')}] [INFO] Le Data Volume '{volume_name}' (ou ce PVC) est déjà enregistré dans Run:ai.")
-        else:
-            print(f"[ERROR] Échec d'enregistrement du Data Volume (HTTP {he.code}): {err_msg}")
-            sys.exit(1)
+        token = token_resp.get("accessToken") or token_resp.get("access_token")
+        headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
 
-    # 4. Partage optionnel vers d'autres scopes (ex: cluster entier ou départements)
-    scopes_to_add = []
-    try:
-        parsed_scopes = json.loads(shared_scopes_raw)
-        if isinstance(parsed_scopes, list):
-            scopes_to_add.extend(parsed_scopes)
-    except Exception:
-        pass
+        q = urllib.parse.urlencode({"filterBy": f"name=={project_name}"})
+        projects = http_json(f"{base_url}/api/v1/org-unit/projects?{q}", headers=headers).get("projects", [])
+        project_id = next((str(p["id"]) for p in projects if p.get("name") == project_name), None)
+        if not project_id:
+            sys.exit(f"Erreur : projet '{project_name}' introuvable dans Run:ai.")
 
-    if share_cluster and cluster_uuid:
-        scopes_to_add.append({"scopeType": "cluster", "scopeId": cluster_uuid})
-
-    if scopes_to_add and dv_id:
-        print(f"[{time.strftime('%X')}] [RUNAI] Application des partages (sharedScopes) sur le Data Volume {dv_id}...")
-        patch_url = f"{runai_url}/api/v1/datavolumes/{dv_id}/sharedScopes"
-        patch_body = {"add": scopes_to_add}
+        print(f"Enregistrement du PVC '{pvc_name}' en Data Volume '{dv_name}' (projectId={project_id})...")
         try:
-            req_patch = urllib.request.Request(
-                patch_url,
-                data=json.dumps(patch_body).encode("utf-8"),
-                headers=auth_headers,
-                method="PATCH"
+            http_json(
+                f"{base_url}/api/v1/datavolumes",
+                method="POST",
+                data={
+                    "name": dv_name,
+                    "description": dv_desc,
+                    "originPvcName": pvc_name,
+                    "projectId": project_id,
+                    "useOriginalVolume": True
+                },
+                headers=headers
             )
-            with urllib.request.urlopen(req_patch, context=ctx, timeout=15) as resp:
-                print(f"[{time.strftime('%X')}] [SUCCESS] Partages configurés avec succès !")
-        except Exception as e:
-            print(f"[WARN] Impossible d'appliquer les sharedScopes: {e}")
+            print("Data Volume enregistré avec succès.")
+        except urllib.error.HTTPError as e:
+            if e.code == 409:
+                print("Data Volume déjà enregistré (409 Conflict ignoré).")
+            else:
+                sys.exit(f"Erreur API Run:ai ({e.code}): {e.read().decode()}")
+
+    if __name__ == "__main__":
+        download_model()
+        register_datavolume()

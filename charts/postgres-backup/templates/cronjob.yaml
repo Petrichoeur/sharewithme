@@ -1,152 +1,147 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ .Release.Name }}-scripts
+data:
+  aws-config: |
+    [default]
+    region = {{ .Values.s3.region }}
+    s3 =
+      addressing_style = path
+
+  dump.sh: |
+    #!/bin/sh
+    set -eu
+
+    TS=$(date -u +%Y%m%dT%H%M%SZ)
+    echo "${TS}" > /work/TIMESTAMP
+
+    echo "Dump de la base ${PGDATABASE} (${TS})..."
+    pg_dump -Fc -f "/work/${PGDATABASE}.dump"
+    pg_restore --list "/work/${PGDATABASE}.dump" > /dev/null
+    echo "Dump terminé et vérifié."
+
+  upload.sh: |
+    #!/bin/sh
+    set -eu
+
+    TS=$(cat /work/TIMESTAMP)
+    DEST="s3://${S3_BUCKET}/${S3_PREFIX}"
+
+    echo "Envoi vers ${DEST}/${TS}/..."
+    aws --endpoint-url "${S3_ENDPOINT}" s3 cp "/work/${PGDATABASE}.dump" "${DEST}/${TS}/${PGDATABASE}.dump" --only-show-errors
+    aws --endpoint-url "${S3_ENDPOINT}" s3 cp /work/TIMESTAMP "${DEST}/LATEST" --only-show-errors
+
+    echo "Rotation S3 (conservation des ${RETENTION_COUNT} derniers backups)..."
+    SNAPSHOTS=$(aws --endpoint-url "${S3_ENDPOINT}" s3 ls "${DEST}/" | awk '/PRE / {sub(/\/$/, "", $2); print $2}' | sort)
+    TOTAL=$(echo "${SNAPSHOTS}" | grep -c . || true)
+
+    if [ "${TOTAL}" -gt "${RETENTION_COUNT}" ]; then
+      TO_DELETE=$((TOTAL - RETENTION_COUNT))
+      for OLD in $(echo "${SNAPSHOTS}" | head -n "${TO_DELETE}"); do
+        echo "Suppression de l'ancien backup ${OLD}..."
+        aws --endpoint-url "${S3_ENDPOINT}" s3 rm "${DEST}/${OLD}/" --recursive --only-show-errors
+      done
+    fi
+    echo "Backup terminé avec succès."
+---
 apiVersion: batch/v1
 kind: CronJob
 metadata:
-  name: {{ include "postgres-backup.fullname" . }}
-  labels:
-    {{- include "postgres-backup.labels" . | nindent 4 }}
+  name: {{ .Release.Name }}
 spec:
-  schedule: {{ .Values.cronjob.schedule | quote }}
-  {{- with .Values.cronjob.timeZone }}
-  timeZone: {{ . | quote }}
-  {{- end }}
-  concurrencyPolicy: {{ .Values.cronjob.concurrencyPolicy }}
-  startingDeadlineSeconds: {{ .Values.cronjob.startingDeadlineSeconds }}
-  successfulJobsHistoryLimit: {{ .Values.cronjob.successfulJobsHistoryLimit }}
-  failedJobsHistoryLimit: {{ .Values.cronjob.failedJobsHistoryLimit }}
+  schedule: {{ .Values.schedule | quote }}
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: 3
+  failedJobsHistoryLimit: 3
   jobTemplate:
     spec:
-      backoffLimit: {{ .Values.cronjob.backoffLimit }}
-      activeDeadlineSeconds: {{ .Values.cronjob.activeDeadlineSeconds }}
+      backoffLimit: 1
       template:
-        metadata:
-          labels:
-            {{- include "postgres-backup.selectorLabels" . | nindent 12 }}
-            app.kubernetes.io/component: backup
         spec:
           restartPolicy: Never
-          {{- include "postgres-backup.pullSecrets" . | nindent 10 }}
-          {{- with .Values.securityContext }}
-          securityContext:
+          {{- with .Values.images.pullSecrets }}
+          imagePullSecrets:
             {{- toYaml . | nindent 12 }}
           {{- end }}
+          securityContext:
+            runAsNonRoot: true
+            seccompProfile:
+              type: RuntimeDefault
           volumes:
             - name: work
               emptyDir:
-                sizeLimit: {{ .Values.workVolume.sizeLimit }}
-            {{- include "postgres-backup.s3Volumes" . | nindent 12 }}
-
+                sizeLimit: {{ .Values.workVolumeSize }}
+            - name: scripts
+              configMap:
+                name: {{ .Release.Name }}-scripts
+                defaultMode: 0755
           initContainers:
             - name: pg-dump
-              image: {{ include "postgres-backup.postgresImage" . | quote }}
-              imagePullPolicy: {{ .Values.backupJob.postgresImage.pullPolicy }}
-              {{- with .Values.containerSecurityContext }}
+              image: {{ .Values.images.postgres | quote }}
+              command: ["/scripts/dump.sh"]
               securityContext:
-                {{- toYaml . | nindent 16 }}
-              {{- end }}
-              command: ["/bin/sh", "-c"]
-              args:
-                - |
-                  set -euo pipefail
-                  TS=$(date -u +%Y%m%dT%H%M%SZ)
-                  OUT="/work/${TS}"
-                  mkdir -p "${OUT}"
-
-                  echo "[$(date -u +%T)] Découverte des bases PostgreSQL sur ${PGHOST}:${PGPORT}..."
-                  if [ -n "${PG_DATABASES:-}" ]; then
-                    DBS="${PG_DATABASES}"
-                  else
-                    DBS=$(psql -d postgres -AtX -c "SELECT datname FROM pg_database WHERE datallowconn AND NOT datistemplate ORDER BY datname")
-                  fi
-
-                  if [ -z "${DBS}" ]; then
-                    echo "[ERROR] Aucune base de données identifiée pour la sauvegarde !" >&2
-                    exit 1
-                  fi
-
-                  echo "[$(date -u +%T)] Bases cibles : ${DBS}"
-                  echo "[$(date -u +%T)] Sauvegarde des objets globaux (rôles, tablespaces)..."
-                  pg_dumpall -l postgres --globals-only -f "${OUT}/globals.sql"
-
-                  for DB in ${DBS}; do
-                    echo "[$(date -u +%T)] Dump de la base '${DB}' vers ${OUT}/${DB}.dump..."
-                    pg_dump -d "${DB}" {{ .Values.postgres.pgDumpArgs }} -f "${OUT}/${DB}.dump"
-                    echo "[$(date -u +%T)] Vérification de l'intégrité de l'archive '${DB}'..."
-                    pg_restore --list "${OUT}/${DB}.dump" > /dev/null
-                  done
-
-                  echo "${TS}" > /work/TIMESTAMP
-                  echo "[$(date -u +%T)] Dump terminé avec succès pour le snapshot ${TS}."
+                allowPrivilegeEscalation: false
+                capabilities:
+                  drop: ["ALL"]
               env:
-                {{- include "postgres-backup.pgEnv" . | nindent 16 }}
-                - name: PG_DATABASES
-                  value: {{ join " " .Values.postgres.databases | quote }}
+                - name: PGHOST
+                  value: {{ .Values.postgres.host | quote }}
+                - name: PGPORT
+                  value: {{ .Values.postgres.port | quote }}
+                - name: PGUSER
+                  value: {{ .Values.postgres.user | quote }}
+                - name: PGDATABASE
+                  value: {{ .Values.postgres.database | quote }}
+                - name: PGPASSWORD
+                  valueFrom:
+                    secretKeyRef:
+                      name: {{ .Values.postgres.secretName }}
+                      key: {{ .Values.postgres.passwordKey }}
               volumeMounts:
                 - name: work
                   mountPath: /work
+                - name: scripts
+                  mountPath: /scripts
               resources:
                 {{- toYaml .Values.resources | nindent 16 }}
-
           containers:
             - name: s3-upload
-              image: {{ include "postgres-backup.s3Image" . | quote }}
-              imagePullPolicy: {{ .Values.backupJob.s3Image.pullPolicy }}
-              {{- with .Values.containerSecurityContext }}
+              image: {{ .Values.images.awsCli | quote }}
+              command: ["/scripts/upload.sh"]
               securityContext:
-                {{- toYaml . | nindent 16 }}
-              {{- end }}
-              command: ["/bin/sh", "-c"]
-              args:
-                - |
-                  set -euo pipefail
-                  s3() { aws --endpoint-url "${S3_ENDPOINT}" s3 "$@"; }
-
-                  TARGET_BUCKET="${S3_BUCKET}"
-                  if [ -z "${TARGET_BUCKET}" ]; then
-                    echo "[$(date -u +%T)] Recherche du bucket S3..."
-                    TARGET_BUCKET=$(s3 ls 2>/dev/null | awk '{print $3}' | grep -v '^$' | head -n 1 || true)
-                    if [ -z "${TARGET_BUCKET}" ]; then
-                      TARGET_BUCKET="backup-runai-backend"
-                      echo "[$(date -u +%T)] Aucun bucket détecté, tentative de création : s3://${TARGET_BUCKET}"
-                      s3 mb "s3://${TARGET_BUCKET}" || true
-                    fi
-                  fi
-
-                  [ -f /work/TIMESTAMP ] || { echo "[ERROR] /work/TIMESTAMP manquant" >&2; exit 1; }
-                  TS=$(cat /work/TIMESTAMP)
-                  BASE="s3://${TARGET_BUCKET}/${S3_PREFIX}"
-
-                  echo "[$(date -u +%T)] Transfert du snapshot ${TS} vers ${BASE}/${TS}/..."
-                  s3 cp "/work/${TS}/" "${BASE}/${TS}/" --recursive --only-show-errors
-
-                  echo "[$(date -u +%T)] Mise à jour du pointeur LATEST..."
-                  echo "${TS}" > /tmp/LATEST
-                  s3 cp /tmp/LATEST "${BASE}/LATEST" --only-show-errors
-
-                  echo "[$(date -u +%T)] Nettoyage du volume local de travail..."
-                  rm -rf "/work/${TS}" /work/TIMESTAMP
-
-                  {{- if .Values.s3.rollingRotation.enabled }}
-                  MAX={{ .Values.s3.rollingRotation.maxSnapshots | int }}
-                  echo "[$(date -u +%T)] Vérification de la rétention (limite : ${MAX} snapshots)..."
-                  BACKUPS=$(s3 ls "${BASE}/" | sed -n 's#^ *PRE \([0-9]\{8\}T[0-9]\{6\}Z\)/$#\1#p' | sort || true)
-                  COUNT=$(printf '%s\n' "${BACKUPS}" | sed '/^$/d' | wc -l)
-                  if [ "${COUNT}" -gt "${MAX}" ]; then
-                    EXCESS=$((COUNT - MAX))
-                    echo "[$(date -u +%T)] Suppression de ${EXCESS} snapshot(s) obsolète(s)..."
-                    printf '%s\n' "${BACKUPS}" | head -n "${EXCESS}" | while read -r OLD; do
-                      [ -n "${OLD}" ] || continue
-                      echo "[$(date -u +%T)] Suppression de ${BASE}/${OLD}/"
-                      s3 rm "${BASE}/${OLD}/" --recursive --only-show-errors
-                    done
-                  fi
-                  {{- end }}
-                  echo "[$(date -u +%T)] Sauvegarde et rotation achevées avec succès."
+                allowPrivilegeEscalation: false
+                capabilities:
+                  drop: ["ALL"]
               env:
-                {{- include "postgres-backup.s3Env" . | nindent 16 }}
-                {{- include "postgres-backup.s3Credentials" (dict "root" . "keys" .Values.s3.secretKeyRef) | nindent 16 }}
+                - name: HOME
+                  value: /tmp
+                - name: AWS_CONFIG_FILE
+                  value: /scripts/aws-config
+                - name: S3_ENDPOINT
+                  value: {{ .Values.s3.endpoint | quote }}
+                - name: S3_BUCKET
+                  value: {{ .Values.s3.bucket | quote }}
+                - name: S3_PREFIX
+                  value: {{ .Values.s3.prefix | quote }}
+                - name: PGDATABASE
+                  value: {{ .Values.postgres.database | quote }}
+                - name: RETENTION_COUNT
+                  value: {{ .Values.s3.retentionCount | quote }}
+                - name: AWS_ACCESS_KEY_ID
+                  valueFrom:
+                    secretKeyRef:
+                      name: {{ .Values.s3.secretName }}
+                      key: {{ .Values.s3.accessKeyIdKey }}
+                - name: AWS_SECRET_ACCESS_KEY
+                  valueFrom:
+                    secretKeyRef:
+                      name: {{ .Values.s3.secretName }}
+                      key: {{ .Values.s3.secretAccessKeyKey }}
               volumeMounts:
                 - name: work
                   mountPath: /work
-                {{- include "postgres-backup.s3VolumeMounts" . | nindent 16 }}
+                - name: scripts
+                  mountPath: /scripts
               resources:
                 {{- toYaml .Values.resources | nindent 16 }}
